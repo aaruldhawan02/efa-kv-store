@@ -145,7 +145,7 @@ inline Network Network::Open() {
     struct fi_info *hints = fi_allocinfo();
     hints->ep_attr->type          = FI_EP_RDM;
     hints->fabric_attr->prov_name = strdup("efa");
-    hints->caps                   = FI_MSG | FI_RMA;
+    hints->caps                   = FI_MSG;
 
     struct fi_info *fi;
     FI_CHECK(fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION),
