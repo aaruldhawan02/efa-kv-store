@@ -174,7 +174,7 @@ inline Network Network::Open() {
 
     struct fid_ep *ep;
     FI_CHECK(fi_endpoint(domain, fi, &ep, nullptr));
-    FI_CHECK(fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV | FI_WRITE | FI_READ));
+    FI_CHECK(fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV));
     FI_CHECK(fi_ep_bind(ep, &av->fid, 0));
     FI_CHECK(fi_enable(ep));
 
