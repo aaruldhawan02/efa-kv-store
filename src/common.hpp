@@ -282,7 +282,9 @@ inline void Network::Progress() {
             msg.context   = op;
             ret = (op->type == RdmaOpType::kRecv)
                 ? fi_recvmsg(ep, &msg, 0)
-                : fi_sendmsg(ep, &msg, 0);
+                : fi_sendmsg(ep, &msg, FI_COMPLETION);
+            fprintf(stderr, "DBG: post %s ret=%zd\n",
+                    op->type == RdmaOpType::kRecv ? "recv" : "send", ret);
         } else {
             struct iovec iov = {op->buf->data, op->len};
             struct fi_rma_iov rma_iov = {op->remote_addr, op->len, op->remote_key};
@@ -320,6 +322,10 @@ inline void Network::HandleCQE(const struct fi_cq_data_entry &cqe) {
 }
 
 inline void Network::Poll() {
+    static uint64_t poll_count = 0;
+    if (++poll_count % 1000000 == 0)
+        fprintf(stderr, "DBG: polled %lu times, pending=%zu\n",
+                poll_count, pending.size());
     struct fi_cq_data_entry cqe[kCQBatch];
     for (;;) {
         ssize_t n = fi_cq_read(cq, cqe, kCQBatch);
