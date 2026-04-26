@@ -7,6 +7,7 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_errno.h>
+#include <rdma/fi_rma.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,10 +33,9 @@
     }                                                                         \
   } while (0)
 
-static constexpr size_t kBufAlign = 128;  // EFA requirement
+static constexpr size_t kBufAlign = 128;
 static constexpr size_t kCQBatch  = 16;
 
-// 32-byte EFA address encoded as 64 hex chars
 struct EfaAddress {
     uint8_t bytes[32];
 
@@ -89,13 +89,15 @@ private:
 };
 
 struct Network;
-enum class RdmaOpType : uint8_t { kRecv, kSend };
+enum class RdmaOpType : uint8_t { kRecv, kSend, kWrite, kRead };
 
 struct RdmaOp {
     RdmaOpType type;
     Buffer    *buf;
-    size_t     len;   // send: bytes to send; recv: filled with received length on completion
-    fi_addr_t  addr;  // send: destination; recv: FI_ADDR_UNSPEC
+    size_t     len;
+    fi_addr_t  addr;
+    uint64_t   remote_addr;  // kWrite/kRead: remote virtual address
+    uint64_t   remote_key;   // kWrite/kRead: remote memory key
     std::function<void(Network &, RdmaOp &)> cb;
 };
 
@@ -112,11 +114,20 @@ struct Network {
 
     static Network Open();
     fi_addr_t      AddPeer(const EfaAddress &peer);
-    void           RegMem(Buffer &buf);
+    void           RegMem(Buffer &buf);     // FI_SEND | FI_RECV
+    void           RegMemRma(Buffer &buf);  // FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE
+    uint64_t       RKey(const Buffer &buf);
+    uint64_t       VAddr(const Buffer &buf);
     struct fid_mr *MR(const Buffer &buf);
 
     void PostRecv(Buffer &buf, std::function<void(Network &, RdmaOp &)> cb);
     void PostSend(fi_addr_t dest, Buffer &buf, size_t len,
+                  std::function<void(Network &, RdmaOp &)> cb);
+    void PostWrite(fi_addr_t dest, Buffer &local_buf, size_t len,
+                   uint64_t remote_addr, uint64_t remote_key,
+                   std::function<void(Network &, RdmaOp &)> cb);
+    void PostRead(fi_addr_t dest, Buffer &local_buf, size_t len,
+                  uint64_t remote_addr, uint64_t remote_key,
                   std::function<void(Network &, RdmaOp &)> cb);
     void Poll();
 
@@ -134,10 +145,9 @@ inline Network Network::Open() {
     struct fi_info *hints = fi_allocinfo();
     hints->ep_attr->type          = FI_EP_RDM;
     hints->fabric_attr->prov_name = strdup("efa");
-    hints->caps                   = FI_MSG;
+    hints->caps                   = FI_MSG | FI_RMA;
 
     struct fi_info *fi;
-    // Use the version from installed headers — works with EFA libfabric 1.30+
     FI_CHECK(fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION),
                         nullptr, nullptr, 0, hints, &fi));
     fi_freeinfo(hints);
@@ -164,7 +174,7 @@ inline Network Network::Open() {
 
     struct fid_ep *ep;
     FI_CHECK(fi_endpoint(domain, fi, &ep, nullptr));
-    FI_CHECK(fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV));
+    FI_CHECK(fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV | FI_WRITE | FI_READ));
     FI_CHECK(fi_ep_bind(ep, &av->fid, 0));
     FI_CHECK(fi_enable(ep));
 
@@ -184,7 +194,7 @@ inline fi_addr_t Network::AddPeer(const EfaAddress &peer) {
 }
 
 inline void Network::RegMem(Buffer &buf) {
-    struct iovec iov     = {buf.data, buf.size};
+    struct iovec iov = {buf.data, buf.size};
     struct fi_mr_attr mr_attr = {};
     mr_attr.mr_iov    = &iov;
     mr_attr.iov_count = 1;
@@ -194,6 +204,25 @@ inline void Network::RegMem(Buffer &buf) {
     mr_map[buf.data] = mr;
 }
 
+inline void Network::RegMemRma(Buffer &buf) {
+    struct iovec iov = {buf.data, buf.size};
+    struct fi_mr_attr mr_attr = {};
+    mr_attr.mr_iov    = &iov;
+    mr_attr.iov_count = 1;
+    mr_attr.access    = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    struct fid_mr *mr;
+    FI_CHECK(fi_mr_regattr(domain, &mr_attr, 0, &mr));
+    mr_map[buf.data] = mr;
+}
+
+inline uint64_t Network::RKey(const Buffer &buf) {
+    return fi_mr_key(MR(buf));
+}
+
+inline uint64_t Network::VAddr(const Buffer &buf) {
+    return (uint64_t)buf.data;
+}
+
 inline struct fid_mr *Network::MR(const Buffer &buf) {
     auto it = mr_map.find(buf.data);
     CHECK(it != mr_map.end());
@@ -201,7 +230,7 @@ inline struct fid_mr *Network::MR(const Buffer &buf) {
 }
 
 inline void Network::PostRecv(Buffer &buf, std::function<void(Network &, RdmaOp &)> cb) {
-    auto *op = new RdmaOp{RdmaOpType::kRecv, &buf, 0, FI_ADDR_UNSPEC, std::move(cb)};
+    auto *op = new RdmaOp{RdmaOpType::kRecv, &buf, 0, FI_ADDR_UNSPEC, 0, 0, std::move(cb)};
     pending.push_back(op);
     Progress();
 }
@@ -209,7 +238,27 @@ inline void Network::PostRecv(Buffer &buf, std::function<void(Network &, RdmaOp 
 inline void Network::PostSend(fi_addr_t dest, Buffer &buf, size_t len,
                                std::function<void(Network &, RdmaOp &)> cb) {
     CHECK(len <= buf.size);
-    auto *op = new RdmaOp{RdmaOpType::kSend, &buf, len, dest, std::move(cb)};
+    auto *op = new RdmaOp{RdmaOpType::kSend, &buf, len, dest, 0, 0, std::move(cb)};
+    pending.push_back(op);
+    Progress();
+}
+
+inline void Network::PostWrite(fi_addr_t dest, Buffer &local_buf, size_t len,
+                                uint64_t remote_addr, uint64_t remote_key,
+                                std::function<void(Network &, RdmaOp &)> cb) {
+    CHECK(len <= local_buf.size);
+    auto *op = new RdmaOp{RdmaOpType::kWrite, &local_buf, len, dest,
+                           remote_addr, remote_key, std::move(cb)};
+    pending.push_back(op);
+    Progress();
+}
+
+inline void Network::PostRead(fi_addr_t dest, Buffer &local_buf, size_t len,
+                               uint64_t remote_addr, uint64_t remote_key,
+                               std::function<void(Network &, RdmaOp &)> cb) {
+    CHECK(len <= local_buf.size);
+    auto *op = new RdmaOp{RdmaOpType::kRead, &local_buf, len, dest,
+                           remote_addr, remote_key, std::move(cb)};
     pending.push_back(op);
     Progress();
 }
@@ -219,25 +268,43 @@ inline void Network::Progress() {
         auto *op = pending.front();
         pending.pop_front();
 
-        struct iovec iov;
-        iov.iov_base = op->buf->data;
-        iov.iov_len  = (op->type == RdmaOpType::kRecv) ? op->buf->size : op->len;
+        ssize_t ret;
 
-        struct fi_msg msg = {};
-        msg.msg_iov   = &iov;
-        msg.desc      = &MR(*op->buf)->mem_desc;
-        msg.iov_count = 1;
-        msg.addr      = (op->type == RdmaOpType::kRecv) ? FI_ADDR_UNSPEC : op->addr;
-        msg.context   = op;
-
-        ssize_t ret = (op->type == RdmaOpType::kRecv)
-            ? fi_recvmsg(ep, &msg, 0)
-            : fi_sendmsg(ep, &msg, 0);
+        if (op->type == RdmaOpType::kRecv || op->type == RdmaOpType::kSend) {
+            struct iovec iov;
+            iov.iov_base = op->buf->data;
+            iov.iov_len  = (op->type == RdmaOpType::kRecv) ? op->buf->size : op->len;
+            struct fi_msg msg = {};
+            msg.msg_iov   = &iov;
+            msg.desc      = &MR(*op->buf)->mem_desc;
+            msg.iov_count = 1;
+            msg.addr      = (op->type == RdmaOpType::kRecv) ? FI_ADDR_UNSPEC : op->addr;
+            msg.context   = op;
+            ret = (op->type == RdmaOpType::kRecv)
+                ? fi_recvmsg(ep, &msg, 0)
+                : fi_sendmsg(ep, &msg, 0);
+        } else {
+            struct iovec iov = {op->buf->data, op->len};
+            struct fi_rma_iov rma_iov = {op->remote_addr, op->len, op->remote_key};
+            struct fi_msg_rma msg = {};
+            msg.msg_iov       = &iov;
+            msg.desc          = &MR(*op->buf)->mem_desc;
+            msg.iov_count     = 1;
+            msg.addr          = op->addr;
+            msg.rma_iov       = &rma_iov;
+            msg.rma_iov_count = 1;
+            msg.context       = op;
+            ret = (op->type == RdmaOpType::kWrite)
+                ? fi_writemsg(ep, &msg, FI_COMPLETION)
+                : fi_readmsg(ep, &msg, FI_COMPLETION);
+        }
 
         if (ret == -FI_EAGAIN) { pending.push_front(op); break; }
         if (ret) {
             fprintf(stderr, "post %s failed: %s\n",
-                    op->type == RdmaOpType::kRecv ? "recv" : "send",
+                    (op->type == RdmaOpType::kRecv ? "recv" :
+                     op->type == RdmaOpType::kSend ? "send" :
+                     op->type == RdmaOpType::kWrite ? "write" : "read"),
                     fi_strerror(-ret));
             delete op;
         }
