@@ -157,7 +157,7 @@ struct ErasureClient {
             auto *req    = (GetRequestMsg *)srv.ctrl_send.data;
             req->type    = MsgType::kGetRequest;
             req->shard_idx = (uint8_t)i;
-            req->_pad[0] = req->_pad[1] = req->_pad[2] = 0;
+            req->_pad[0] = req->_pad[1] = 0;
             req->key_len = (uint32_t)key.size();
             memcpy((char *)srv.ctrl_send.data + sizeof(GetRequestMsg),
                    key.data(), key.size());
@@ -213,7 +213,7 @@ struct ErasureClient {
             auto *req    = (DelRequestMsg *)srv.ctrl_send.data;
             req->type    = MsgType::kDelRequest;
             req->shard_idx = (uint8_t)i;
-            req->_pad[0] = req->_pad[1] = req->_pad[2] = 0;
+            req->_pad[0] = req->_pad[1] = 0;
             req->key_len = (uint32_t)key.size();
             memcpy((char *)srv.ctrl_send.data + sizeof(DelRequestMsg),
                    key.data(), key.size());
