@@ -12,7 +12,7 @@ sudo dnf install -y gcc-c++ make
 echo "=== Installing ISA-L (erasure coding) ==="
 if ! sudo dnf install -y isa-l-devel 2>/dev/null; then
     echo "isa-l-devel not in repos, building from source..."
-    sudo dnf install -y autoconf automake libtool curl
+    sudo dnf install -y autoconf automake libtool
     # nasm is only needed on x86; ARM uses portable C fallback
     if [[ "$(uname -m)" == "x86_64" ]] && ! command -v nasm &>/dev/null; then
         sudo dnf install -y nasm || true
