@@ -137,7 +137,9 @@ inline Network Network::Open() {
     hints->caps                   = FI_MSG;
 
     struct fi_info *fi;
-    FI_CHECK(fi_getinfo(FI_VERSION(2, 0), nullptr, nullptr, 0, hints, &fi));
+    // Use the version from installed headers — works with EFA libfabric 1.30+
+    FI_CHECK(fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION),
+                        nullptr, nullptr, 0, hints, &fi));
     fi_freeinfo(hints);
 
     fprintf(stderr, "fabric: %s, domain: %s, link: %.0fGbps\n",

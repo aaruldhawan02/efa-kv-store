@@ -1,42 +1,33 @@
 #include "common.hpp"
 #include "protocol.hpp"
+#include <inttypes.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <inttypes.h>
 
-// In-memory key-value store
-struct KVStore {
-    std::unordered_map<std::string, std::vector<uint8_t>> data;
-
-    void Put(const char *key, size_t klen, const uint8_t *val, size_t vlen) {
-        data[std::string(key, klen)] = std::vector<uint8_t>(val, val + vlen);
-    }
-
-    bool Get(const char *key, size_t klen, const uint8_t **val_out, size_t *vlen_out) const {
-        auto it = data.find(std::string(key, klen));
-        if (it == data.end()) return false;
-        *val_out  = it->second.data();
-        *vlen_out = it->second.size();
-        return true;
-    }
-
-    bool Delete(const char *key, size_t klen) {
-        return data.erase(std::string(key, klen)) > 0;
-    }
-};
+// Storage key = object key + '\0' + shard_idx byte
+static std::string shard_key(const char *key, size_t klen, uint8_t shard_idx) {
+    std::string s(key, klen);
+    s += '\0';
+    s += (char)shard_idx;
+    return s;
+}
 
 static void send_response(Network &net, fi_addr_t dest, Buffer &send_buf,
-                           StatusCode status, const uint8_t *val, size_t vlen) {
-    CHECK(response_size(vlen) <= send_buf.size);
-    auto *hdr  = (ResponseHeader *)send_buf.data;
-    hdr->status  = status;
-    hdr->val_len = (uint32_t)vlen;
-    if (val && vlen > 0)
-        memcpy((uint8_t *)send_buf.data + sizeof(ResponseHeader), val, vlen);
+                           StatusCode status, uint8_t shard_idx,
+                           const uint8_t *shard_data, size_t shard_len,
+                           uint32_t object_size) {
+    CHECK(response_bytes(shard_len) <= send_buf.size);
+    auto *hdr        = (ResponseHeader *)send_buf.data;
+    hdr->status      = status;
+    hdr->shard_idx   = shard_idx;
+    hdr->shard_len   = (uint32_t)shard_len;
+    hdr->object_size = object_size;
+    if (shard_data && shard_len > 0)
+        memcpy((uint8_t *)send_buf.data + sizeof(ResponseHeader), shard_data, shard_len);
 
     bool done = false;
-    net.PostSend(dest, send_buf, response_size(vlen),
+    net.PostSend(dest, send_buf, response_bytes(shard_len),
                  [&done](Network &, RdmaOp &) { done = true; });
     while (!done) net.Poll();
 }
@@ -44,11 +35,15 @@ static void send_response(Network &net, fi_addr_t dest, Buffer &send_buf,
 int main() {
     auto net = Network::Open();
     printf("address: %s\n", net.addr.ToString().c_str());
-    printf("Run client: ./build/client %s\n\n", net.addr.ToString().c_str());
+    printf("Run client: ./build/client <num_servers> %s [addr2 ...] bench 1000 65536\n\n",
+           net.addr.ToString().c_str());
 
-    KVStore  kv;
-    Buffer   recv_buf = Buffer::Alloc(kMsgBufSize);
-    Buffer   send_buf = Buffer::Alloc(kMsgBufSize);
+    // shard storage: shard_key -> (object_size, shard_bytes)
+    struct ShardEntry { uint32_t object_size; std::vector<uint8_t> data; };
+    std::unordered_map<std::string, ShardEntry> store;
+
+    Buffer recv_buf = Buffer::Alloc(kMsgBufSize);
+    Buffer send_buf = Buffer::Alloc(kMsgBufSize);
     net.RegMem(recv_buf);
     net.RegMem(send_buf);
 
@@ -56,67 +51,71 @@ int main() {
     uint64_t  ops_put = 0, ops_get = 0, ops_del = 0;
 
     for (;;) {
-        // Wait for one message
-        bool     got_msg  = false;
-        size_t   msg_len  = 0;
-        net.PostRecv(recv_buf, [&](Network &, RdmaOp &op) {
-            got_msg = true;
-            msg_len = op.len;
-        });
-        while (!got_msg) net.Poll();
+        bool   got  = false;
+        size_t mlen = 0;
+        net.PostRecv(recv_buf, [&](Network &, RdmaOp &op) { got = true; mlen = op.len; });
+        while (!got) net.Poll();
 
-        auto *data     = (const uint8_t *)recv_buf.data;
-        auto  msg_type = (MsgType)data[0];
+        auto *raw  = (const uint8_t *)recv_buf.data;
+        auto  type = (MsgType)raw[0];
 
-        if (msg_type == MsgType::kConnect) {
-            auto *msg  = (const ConnectMsg *)data;
+        if (type == MsgType::kConnect) {
+            auto *msg   = (const ConnectMsg *)raw;
             EfaAddress peer(msg->addr);
             client_addr = net.AddPeer(peer);
-            printf("Client connected: %s\n", peer.ToString().c_str());
+            printf("client connected: %s\n", peer.ToString().c_str());
             continue;
         }
 
         CHECK(client_addr != FI_ADDR_UNSPEC);
-        auto *hdr = (const RequestHeader *)data;
-        CHECK(msg_len >= sizeof(RequestHeader));
-        const char    *key = (const char *)(data + sizeof(RequestHeader));
-        const uint8_t *val = (const uint8_t *)key + hdr->key_len;
+        CHECK(mlen >= sizeof(ShardRequestHeader));
+        auto *hdr = (const ShardRequestHeader *)raw;
+        const char *key = (const char *)(raw + sizeof(ShardRequestHeader));
+        const uint8_t *shard_data = (const uint8_t *)key + hdr->key_len;
+        auto sk = shard_key(key, hdr->key_len, hdr->shard_idx);
 
-        switch (msg_type) {
-        case MsgType::kPut:
-            kv.Put(key, hdr->key_len, val, hdr->val_len);
-            send_response(net, client_addr, send_buf, StatusCode::kOk, nullptr, 0);
+        switch (type) {
+        case MsgType::kPutShard:
+            store[sk] = {hdr->object_size,
+                         std::vector<uint8_t>(shard_data, shard_data + hdr->shard_len)};
+            send_response(net, client_addr, send_buf,
+                          StatusCode::kOk, hdr->shard_idx, nullptr, 0, 0);
             ++ops_put;
             break;
 
-        case MsgType::kGet: {
-            const uint8_t *resp_val  = nullptr;
-            size_t         resp_vlen = 0;
-            bool found = kv.Get(key, hdr->key_len, &resp_val, &resp_vlen);
-            send_response(net, client_addr, send_buf,
-                          found ? StatusCode::kOk : StatusCode::kNotFound,
-                          resp_val, found ? resp_vlen : 0);
+        case MsgType::kGetShard: {
+            auto it = store.find(sk);
+            if (it == store.end()) {
+                send_response(net, client_addr, send_buf,
+                              StatusCode::kNotFound, hdr->shard_idx, nullptr, 0, 0);
+            } else {
+                auto &entry = it->second;
+                send_response(net, client_addr, send_buf, StatusCode::kOk,
+                              hdr->shard_idx,
+                              entry.data.data(), entry.data.size(), entry.object_size);
+            }
             ++ops_get;
             break;
         }
 
-        case MsgType::kDelete: {
-            bool found = kv.Delete(key, hdr->key_len);
+        case MsgType::kDelShard: {
+            bool found = store.erase(sk) > 0;
             send_response(net, client_addr, send_buf,
                           found ? StatusCode::kOk : StatusCode::kNotFound,
-                          nullptr, 0);
+                          hdr->shard_idx, nullptr, 0, 0);
             ++ops_del;
             break;
         }
 
         default:
-            fprintf(stderr, "Unknown message type %d\n", (int)msg_type);
-            send_response(net, client_addr, send_buf, StatusCode::kError, nullptr, 0);
+            fprintf(stderr, "unknown msg type %d\n", (int)type);
+            send_response(net, client_addr, send_buf,
+                          StatusCode::kError, 0, nullptr, 0, 0);
         }
 
-        if ((ops_put + ops_get + ops_del) % 10000 == 0)
+        uint64_t total = ops_put + ops_get + ops_del;
+        if (total > 0 && total % 10000 == 0)
             printf("stats: put=%" PRIu64 " get=%" PRIu64 " del=%" PRIu64
-                   " kv_size=%zu\n",
-                   ops_put, ops_get, ops_del, kv.data.size());
+                   " keys=%zu\n", ops_put, ops_get, ops_del, store.size());
     }
 }

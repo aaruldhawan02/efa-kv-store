@@ -2,16 +2,21 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// Max sizes.  Shard size = ceil(object_size / k), so with k=2 and 1MB objects
+// each shard is ≤ 512KB.  We size the buffer for worst-case 1 shard = 1MB.
 static constexpr size_t kMaxKeySize   = 256;
-static constexpr size_t kMaxValueSize = 1u * 1024 * 1024;  // 1 MB
-static constexpr size_t kMsgBufSize   = 32 + kMaxKeySize + kMaxValueSize;
+static constexpr size_t kMaxShardSize = 1u * 1024 * 1024;   // 1 MB per shard
+static constexpr size_t kMsgBufSize   =
+    64 + kMaxKeySize + kMaxShardSize;  // header + key + shard payload
+
+// ── Message types ────────────────────────────────────────────────────────────
 
 enum class MsgType : uint8_t {
-    kConnect  = 0,
-    kPut      = 1,
-    kGet      = 2,
-    kDelete   = 3,
-    kResponse = 4,
+    kConnect   = 0,  // exchange EFA addresses
+    kPutShard  = 1,  // store one shard
+    kGetShard  = 2,  // retrieve one shard
+    kDelShard  = 3,  // delete one shard
+    kResponse  = 4,
 };
 
 enum class StatusCode : uint8_t {
@@ -20,28 +25,44 @@ enum class StatusCode : uint8_t {
     kError    = 2,
 };
 
-// CONNECT  → [MsgType=kConnect][EFA addr: 32 bytes]
+// ── Wire structures (packed, no padding) ─────────────────────────────────────
+
+// kConnect: [ConnectMsg]
 struct ConnectMsg {
-    MsgType type;
-    uint8_t addr[32];
+    MsgType type;       // kConnect
+    uint8_t addr[32];   // sender's EFA address
 } __attribute__((packed));
 
-// PUT      → [RequestHeader][key: key_len bytes][value: val_len bytes]
-// GET/DEL  → [RequestHeader][key: key_len bytes]  (val_len == 0)
-struct RequestHeader {
+// kPutShard / kGetShard / kDelShard: [ShardRequestHeader][key bytes][shard bytes]
+//   For GET and DEL, shard_len == 0 and shard_size == 0.
+//   shard_size is the unpadded object size (needed for reconstruction).
+struct ShardRequestHeader {
     MsgType  type;
     uint32_t key_len;
-    uint32_t val_len;
+    uint32_t shard_len;    // bytes of shard data that follow (0 for GET/DEL)
+    uint32_t object_size;  // original full object size (for Decode)
+    uint8_t  shard_idx;    // which shard this is (0..k+m-1)
+    uint8_t  k;            // data shards (needed by server to label storage)
+    uint8_t  m;            // parity shards
+    uint8_t  _pad;
 } __attribute__((packed));
 
-// Response → [ResponseHeader][value: val_len bytes]  (val only for GET)
+// kResponse: [ResponseHeader][shard bytes]
+//   shard bytes are present only for kGetShard responses.
+//   shard_idx lets the client match replies that arrive out of order.
 struct ResponseHeader {
     StatusCode status;
-    uint32_t   val_len;
+    uint8_t    shard_idx;
+    uint32_t   shard_len;   // bytes of shard data that follow
+    uint32_t   object_size;
 } __attribute__((packed));
 
-static inline size_t connect_msg_size()            { return sizeof(ConnectMsg); }
-static inline size_t request_size(size_t kl, size_t vl) {
-    return sizeof(RequestHeader) + kl + vl;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+static inline size_t connect_msg_bytes()                     { return sizeof(ConnectMsg); }
+static inline size_t shard_request_bytes(size_t kl, size_t sl) {
+    return sizeof(ShardRequestHeader) + kl + sl;
 }
-static inline size_t response_size(size_t vl)      { return sizeof(ResponseHeader) + vl; }
+static inline size_t response_bytes(size_t sl) {
+    return sizeof(ResponseHeader) + sl;
+}
