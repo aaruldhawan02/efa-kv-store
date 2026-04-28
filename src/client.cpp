@@ -27,52 +27,37 @@ static void print_latency(std::vector<long long> &ns, const char *label,
            1e9 / avg, bw);
 }
 
-// ── Per-server connection ──────────────────────────────────────────────────────
+// ── Per-server connection ─────────────────────────────────────────────────────
 
 struct ServerConn {
-    fi_addr_t addr;
-    Buffer    ctrl_send;   // control messages (send/recv)
-    Buffer    ctrl_recv;
-    Buffer    data_buf;    // local RMA buffer (RDMA write source / read dest)
+    Buffer     ctrl_send;
+    Buffer     ctrl_recv;
+    Buffer     data_buf;
+    Connection conn;
 
-    ServerConn(Network &net, const EfaAddress &server_efa)
+    ServerConn(Network &net, const FabricAddress &server_addr)
         : ctrl_send(Buffer::Alloc(kCtrlBufSize)),
           ctrl_recv(Buffer::Alloc(kCtrlBufSize)),
-          data_buf(Buffer::Alloc(kDataBufSize)) {
-        addr = net.AddPeer(server_efa);
-        net.RegMem(ctrl_send);
-        net.RegMem(ctrl_recv);
-        net.RegMemRma(data_buf);
+          data_buf(Buffer::Alloc(kDataBufSize)),
+          conn(net.Connect(server_addr)) {
+        conn.RegMem(ctrl_send);
+        conn.RegMem(ctrl_recv);
+        conn.RegMemRma(data_buf);
     }
 };
 
 // ── ErasureClient ─────────────────────────────────────────────────────────────
 
 struct ErasureClient {
-    Network             &net;
-    int                  k, m;
-    ErasureCoder         ec;
+    int   k, m;
+    ErasureCoder ec;
     std::vector<ServerConn> servers;
 
     ErasureClient(Network &net, int k, int m,
-                  const std::vector<EfaAddress> &addrs)
-        : net(net), k(k), m(m), ec(k, m) {
+                  const std::vector<FabricAddress> &addrs)
+        : k(k), m(m), ec(k, m) {
         CHECK((int)addrs.size() == k + m);
         for (auto &a : addrs) servers.emplace_back(net, a);
-    }
-
-    void Connect() {
-        for (int i = 0; i < k + m; i++) {
-            auto *msg  = (ConnectMsg *)servers[i].ctrl_send.data;
-            msg->type  = MsgType::kConnect;
-            memcpy(msg->addr, net.addr.bytes, 32);
-
-            bool done = false;
-            net.PostSend(servers[i].addr, servers[i].ctrl_send,
-                         sizeof(ConnectMsg),
-                         [&done](Network &, RdmaOp &) { done = true; });
-            while (!done) net.Poll();
-        }
         printf("Connected to %d servers (k=%d m=%d).\n", k + m, k, m);
     }
 
@@ -80,7 +65,7 @@ struct ErasureClient {
     bool Put(const std::string &key, const uint8_t *data, size_t data_len) {
         auto shards = ec.Encode(data, data_len);
 
-        // Phase 1: send PutRequest to all k+m servers in parallel
+        // Phase 1: send PutRequest to all k+m servers
         for (int i = 0; i < k + m; i++) {
             auto &srv = servers[i];
             auto *req       = (PutRequestMsg *)srv.ctrl_send.data;
@@ -95,63 +80,68 @@ struct ErasureClient {
             req->_pad2      = 0;
             memcpy((char *)srv.ctrl_send.data + sizeof(PutRequestMsg),
                    key.data(), key.size());
-            net.PostSend(srv.addr, srv.ctrl_send,
-                         sizeof(PutRequestMsg) + key.size(),
-                         [](Network &, RdmaOp &) {});
+            srv.conn.PostSend(srv.ctrl_send,
+                              sizeof(PutRequestMsg) + key.size(),
+                              [](Connection &, RdmaOp &) {});
         }
-        while (!net.pending.empty()) net.Poll();
+        for (auto &srv : servers)
+            while (!srv.conn.pending.empty()) srv.conn.Poll();
 
         // Phase 2: receive SlotGrants from all servers
         int inflight = k + m;
         std::vector<SlotGrantMsg> grants(k + m);
         for (int i = 0; i < k + m; i++) {
             int idx = i;
-            net.PostRecv(servers[i].ctrl_recv,
-                         [&, idx](Network &, RdmaOp &op) {
-                memcpy(&grants[idx], op.buf->data, sizeof(SlotGrantMsg));
-                --inflight;
-            });
+            servers[i].conn.PostRecv(servers[i].ctrl_recv,
+                [&, idx](Connection &, RdmaOp &op) {
+                    memcpy(&grants[idx], op.buf->data, sizeof(SlotGrantMsg));
+                    --inflight;
+                });
         }
-        while (inflight > 0) net.Poll();
+        while (inflight > 0)
+            for (auto &srv : servers) srv.conn.Poll();
 
-        // Phase 3: RDMA write shard data directly into each server's slot
+        // Phase 3: RDMA write shard data into each server's slot
         inflight = k + m;
         for (int i = 0; i < k + m; i++) {
             auto &srv = servers[i];
             CHECK(shards[i].size() <= srv.data_buf.size);
             memcpy(srv.data_buf.data, shards[i].data(), shards[i].size());
-            net.PostWrite(srv.addr, srv.data_buf, shards[i].size(),
-                          grants[i].remote_addr, grants[i].rkey,
-                          [&inflight](Network &, RdmaOp &) { --inflight; });
+            srv.conn.PostWrite(srv.data_buf, shards[i].size(),
+                               grants[i].remote_addr, grants[i].rkey,
+                               [&inflight](Connection &, RdmaOp &) { --inflight; });
         }
-        while (inflight > 0) net.Poll();  // wait for all writes before committing
+        while (inflight > 0)
+            for (auto &srv : servers) srv.conn.Poll();
 
-        // Phase 4: send PutCommit to all servers (writes are done)
+        // Phase 4: send PutCommit to all servers
         for (int i = 0; i < k + m; i++) {
             auto &srv       = servers[i];
             auto *commit    = (PutCommitMsg *)srv.ctrl_send.data;
             commit->type    = MsgType::kPutCommit;
             memset(commit->_pad, 0, sizeof(commit->_pad));
             commit->slot_idx = grants[i].slot_idx;
-            net.PostSend(srv.addr, srv.ctrl_send, sizeof(PutCommitMsg),
-                         [](Network &, RdmaOp &) {});
+            srv.conn.PostSend(srv.ctrl_send, sizeof(PutCommitMsg),
+                              [](Connection &, RdmaOp &) {});
         }
-        while (!net.pending.empty()) net.Poll();
+        for (auto &srv : servers)
+            while (!srv.conn.pending.empty()) srv.conn.Poll();
 
         // Phase 5: receive Acks
         inflight = k + m;
         for (int i = 0; i < k + m; i++) {
-            net.PostRecv(servers[i].ctrl_recv,
-                         [&inflight](Network &, RdmaOp &) { --inflight; });
+            servers[i].conn.PostRecv(servers[i].ctrl_recv,
+                [&inflight](Connection &, RdmaOp &) { --inflight; });
         }
-        while (inflight > 0) net.Poll();
+        while (inflight > 0)
+            for (auto &srv : servers) srv.conn.Poll();
 
         return true;
     }
 
     // GET: request slot info → RDMA read shard data → decode
     std::vector<uint8_t> Get(const std::string &key) {
-        // Phase 1: send GetRequest to k data servers in parallel
+        // Phase 1: send GetRequest to k data servers
         for (int i = 0; i < k; i++) {
             auto &srv    = servers[i];
             auto *req    = (GetRequestMsg *)srv.ctrl_send.data;
@@ -161,26 +151,28 @@ struct ErasureClient {
             req->key_len = (uint32_t)key.size();
             memcpy((char *)srv.ctrl_send.data + sizeof(GetRequestMsg),
                    key.data(), key.size());
-            net.PostSend(srv.addr, srv.ctrl_send,
-                         sizeof(GetRequestMsg) + key.size(),
-                         [](Network &, RdmaOp &) {});
+            srv.conn.PostSend(srv.ctrl_send,
+                              sizeof(GetRequestMsg) + key.size(),
+                              [](Connection &, RdmaOp &) {});
         }
-        while (!net.pending.empty()) net.Poll();
+        for (int i = 0; i < k; i++)
+            while (!servers[i].conn.pending.empty()) servers[i].conn.Poll();
 
         // Phase 2: receive SlotInfo from each server
         int inflight = k;
         std::vector<SlotInfoMsg> infos(k + m);
         for (int i = 0; i < k; i++) {
             int idx = i;
-            net.PostRecv(servers[i].ctrl_recv,
-                         [&, idx](Network &, RdmaOp &op) {
-                memcpy(&infos[idx], op.buf->data, sizeof(SlotInfoMsg));
-                --inflight;
-            });
+            servers[i].conn.PostRecv(servers[i].ctrl_recv,
+                [&, idx](Connection &, RdmaOp &op) {
+                    memcpy(&infos[idx], op.buf->data, sizeof(SlotInfoMsg));
+                    --inflight;
+                });
         }
-        while (inflight > 0) net.Poll();
+        while (inflight > 0)
+            for (int i = 0; i < k; i++) servers[i].conn.Poll();
 
-        // Phase 3: RDMA read shard data directly from each server's slot
+        // Phase 3: RDMA read shard data from each server's slot
         std::vector<std::vector<uint8_t>> shards(k + m);
         std::vector<bool>                 present(k + m, false);
         uint32_t object_size = 0;
@@ -190,18 +182,19 @@ struct ErasureClient {
             CHECK(infos[i].status == StatusCode::kOk);
             int      idx       = i;
             uint32_t shard_len = infos[i].shard_len;
-            net.PostRead(servers[i].addr, servers[i].data_buf, shard_len,
-                         infos[i].remote_addr, infos[i].rkey,
-                         [&, idx, shard_len](Network &, RdmaOp &op) {
-                int sidx = infos[idx].shard_idx;
-                object_size = infos[idx].object_size;
-                const uint8_t *sd = (const uint8_t *)op.buf->data;
-                shards[sidx] = std::vector<uint8_t>(sd, sd + shard_len);
-                present[sidx] = true;
-                --inflight;
-            });
+            servers[i].conn.PostRead(servers[i].data_buf, shard_len,
+                infos[i].remote_addr, infos[i].rkey,
+                [&, idx, shard_len](Connection &, RdmaOp &op) {
+                    int sidx = infos[idx].shard_idx;
+                    object_size = infos[idx].object_size;
+                    const uint8_t *sd = (const uint8_t *)op.buf->data;
+                    shards[sidx] = std::vector<uint8_t>(sd, sd + shard_len);
+                    present[sidx] = true;
+                    --inflight;
+                });
         }
-        while (inflight > 0) net.Poll();
+        while (inflight > 0)
+            for (int i = 0; i < k; i++) servers[i].conn.Poll();
 
         return ec.Decode(shards, present, object_size);
     }
@@ -217,18 +210,20 @@ struct ErasureClient {
             req->key_len = (uint32_t)key.size();
             memcpy((char *)srv.ctrl_send.data + sizeof(DelRequestMsg),
                    key.data(), key.size());
-            net.PostSend(srv.addr, srv.ctrl_send,
-                         sizeof(DelRequestMsg) + key.size(),
-                         [](Network &, RdmaOp &) {});
+            srv.conn.PostSend(srv.ctrl_send,
+                              sizeof(DelRequestMsg) + key.size(),
+                              [](Connection &, RdmaOp &) {});
         }
-        while (!net.pending.empty()) net.Poll();
+        for (auto &srv : servers)
+            while (!srv.conn.pending.empty()) srv.conn.Poll();
 
         int inflight = k + m;
         for (int i = 0; i < k + m; i++) {
-            net.PostRecv(servers[i].ctrl_recv,
-                         [&inflight](Network &, RdmaOp &) { --inflight; });
+            servers[i].conn.PostRecv(servers[i].ctrl_recv,
+                [&inflight](Connection &, RdmaOp &) { --inflight; });
         }
-        while (inflight > 0) net.Poll();
+        while (inflight > 0)
+            for (auto &srv : servers) srv.conn.Poll();
     }
 };
 
@@ -283,38 +278,65 @@ static void bench_get(ErasureClient &c, size_t num_ops, size_t obj_size) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <addr0> [<addr1> ...] <mode> <num_ops> <obj_bytes>\n"
+        "Usage: %s <addr0> [<addr1> ...] [-k <k>] <mode> <num_ops> <obj_bytes>\n"
         "\n"
-        "  Addresses are 64-char hex EFA addresses (one per server).\n"
-        "  n_servers determines k+m.  k = n_servers-1, m = 1.\n"
-        "  For 1 server: k=1, m=0 (no erasure).  For 3 servers: k=2, m=1.\n"
+        "  Addresses are hex fabric addresses printed by each server.\n"
+        "  n_servers = k + m (total servers).  Default: k = n-1, m = 1.\n"
+        "  Use -k to set k explicitly; m = n_servers - k.\n"
         "\n"
         "  mode: put | get | bench\n"
         "\n"
-        "Example:\n"
-        "  %s <addr0> <addr1> <addr2> bench 1000 65536\n",
-        prog, prog);
+        "Examples:\n"
+        "  %s <a0> <a1> <a2> bench 1000 65536          # k=2 m=1\n"
+        "  %s <a0>..<a5> -k 4 bench 10000 65536        # k=4 m=2\n",
+        prog, prog, prog);
     std::exit(1);
 }
 
 int main(int argc, char **argv) {
     if (argc < 5) usage(argv[0]);
 
-    std::vector<EfaAddress> addrs;
+    std::vector<FabricAddress> addrs;
     int i = 1;
-    while (i < argc && strlen(argv[i]) == 64) {
-        addrs.push_back(EfaAddress::Parse(argv[i]));
+    while (i < argc) {
+        size_t l = strlen(argv[i]);
+        if (l < 2 || l % 2 != 0 || l > 128) break;
+        bool is_hex = true;
+        for (size_t j = 0; j < l && is_hex; j++)
+            is_hex = isxdigit((unsigned char)argv[i][j]);
+        if (!is_hex) break;
+        addrs.push_back(FabricAddress::Parse(argv[i]));
         i++;
     }
-    if (addrs.empty() || i + 2 >= argc) usage(argv[0]);
+    if (addrs.empty()) usage(argv[0]);
+
+    // Optional -k flag.
+    int explicit_k = -1;
+    if (i < argc && strcmp(argv[i], "-k") == 0) {
+        i++;
+        if (i >= argc) usage(argv[0]);
+        explicit_k = std::stoi(argv[i++]);
+    }
+
+    if (i + 2 >= argc) usage(argv[0]);
 
     std::string mode      = argv[i++];
     size_t      num_ops   = std::stoull(argv[i++]);
     size_t      obj_bytes = std::stoull(argv[i]);
 
     int n = (int)addrs.size();
-    int k = (n > 1) ? n - 1 : 1;
-    int m = (n > 1) ? 1 : 0;
+    int k, m;
+    if (explicit_k > 0) {
+        k = explicit_k;
+        m = n - k;
+        if (m < 0 || k + m != n) {
+            fprintf(stderr, "ERROR: -k %d incompatible with %d servers\n", k, n);
+            std::exit(1);
+        }
+    } else {
+        k = (n > 1) ? n - 1 : 1;
+        m = (n > 1) ? 1 : 0;
+    }
 
     if (obj_bytes == 0 || obj_bytes > (size_t)k * kMaxShardSize) {
         fprintf(stderr, "obj_bytes must be 1..%zu\n", (size_t)k * kMaxShardSize);
@@ -323,7 +345,6 @@ int main(int argc, char **argv) {
 
     auto net = Network::Open();
     ErasureClient c(net, k, m, addrs);
-    c.Connect();
 
     if (mode == "put") {
         bench_put(c, num_ops, obj_bytes);

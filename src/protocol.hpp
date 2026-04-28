@@ -12,7 +12,6 @@ static constexpr size_t kDataBufSize  = kMaxShardSize;      // local RMA buffer
 // small control signals only.
 
 enum class MsgType : uint8_t {
-    kConnect    = 0,  // client sends its EFA address
     kPutRequest = 1,  // client requests a slot to write into
     kSlotGrant  = 2,  // server grants slot: remote_addr + rkey
     kPutCommit  = 3,  // client signals RDMA write is complete
@@ -30,11 +29,6 @@ enum class StatusCode : uint8_t {
 };
 
 // ── Wire structures ───────────────────────────────────────────────────────────
-
-struct ConnectMsg {
-    MsgType type;
-    uint8_t addr[32];
-} __attribute__((packed));
 
 // [PutRequestMsg][key_len bytes]
 struct PutRequestMsg {

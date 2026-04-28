@@ -1,10 +1,13 @@
-# EFA libfabric (from AWS EFA installer at /opt/amazon/efa)
-EFA_PREFIX ?= /opt/amazon/efa
+# Use system libfabric (verbs/RoCE).
+# Override FABRIC_PREFIX if libfabric is installed elsewhere, e.g.:
+#   make FABRIC_PREFIX=/opt/amazon/efa   (EFA)
+#   make FABRIC_PREFIX=/usr/local         (custom build)
+FABRIC_PREFIX ?= /usr
 
 CXX      = g++
 CXXFLAGS = -std=c++17 -O2 -g -Wall \
-           -I$(EFA_PREFIX)/include
-LDFLAGS  = -L$(EFA_PREFIX)/lib64 -Wl,-rpath,$(EFA_PREFIX)/lib64
+           -I$(FABRIC_PREFIX)/include
+LDFLAGS  = -L$(FABRIC_PREFIX)/lib -Wl,-rpath,$(FABRIC_PREFIX)/lib
 LDLIBS   = -lfabric -lpthread -lisal
 
 BINARIES = build/server build/client
