@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -86,7 +87,25 @@ struct PoolAlloc {
     }
 };
 
-// Register with coordinator; coordinator auto-assigns and returns shard index.
+// Background thread: keeps coordinator TCP connection alive by responding to
+// PING messages with PONG. The coordinator uses this for failure detection.
+static void coord_keepalive(int fd) {
+    char buf[32];
+    while (true) {
+        int r = recv(fd, buf, sizeof(buf) - 1, 0);
+        if (r <= 0) {
+            fprintf(stderr, "Coordinator connection lost.\n");
+            close(fd);
+            return;
+        }
+        buf[r] = '\0';
+        if (strncmp(buf, "PING", 4) == 0)
+            send(fd, "PONG\n", 5, MSG_NOSIGNAL);
+    }
+}
+
+// Register with coordinator; returns the persistent fd (caller must not close).
+// Coordinator auto-assigns and returns shard index.
 static int coord_register(const char *host, int port,
                            const std::string &hex_addr) {
     addrinfo hints{}, *res;
@@ -107,14 +126,14 @@ static int coord_register(const char *host, int port,
     int n = snprintf(msg, sizeof(msg), "REGISTER %s\n", hex_addr.c_str());
     send(fd, msg, n, 0);
     char resp[64] = {};
-    recv(fd, resp, sizeof(resp)-1, 0);
-    close(fd);
+    recv(fd, resp, sizeof(resp) - 1, 0);
     // Response: "OK <idx>\n"
     int idx = -1;
     sscanf(resp, "OK %d", &idx);
     fprintf(stderr, "Registered as shard %d with coordinator %s:%d\n",
             idx, host, port);
-    return idx;
+    // Keep fd open — coordinator will send PINGs on it
+    return fd;
 }
 
 int main(int argc, char **argv) {
@@ -135,8 +154,11 @@ int main(int argc, char **argv) {
     printf("address: %s\n", listen_addr.ToString().c_str());
     fflush(stdout);
 
-    if (coord_host)
-        coord_register(coord_host, coord_port, listen_addr.ToString());
+    if (coord_host) {
+        int coord_fd = coord_register(coord_host, coord_port, listen_addr.ToString());
+        if (coord_fd >= 0)
+            std::thread(coord_keepalive, coord_fd).detach();
+    }
 
     Buffer pool      = Buffer::Alloc(kPoolSize);
     Buffer ctrl_recv = Buffer::Alloc(kCtrlBufSize);

@@ -3,11 +3,14 @@
 #include "ec.hpp"
 #include "protocol.hpp"
 #include <arpa/inet.h>
+#include <atomic>
 #include <chrono>
 #include <netdb.h>
 #include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 using _Clock = std::chrono::high_resolution_clock;
@@ -47,26 +50,59 @@ struct ServerConn {
     }
 };
 
+// ── ClusterInfo (forward-declared here, defined after coord_discover) ──────────
+struct ClusterInfo;
+
 // ── ErasureClient ──────────────────────────────────────────────────────────────
 
 struct ErasureClient {
     int   k, m;
     ErasureCoder ec;
     std::vector<ServerConn> servers;
+    std::unique_ptr<std::atomic<bool>[]> dead; // dead[i] — separate to keep ServerConn movable
     PhaseTimes last_put_phases;
     PhaseTimes last_get_phases;
 
-    ErasureClient(Network &net, int k, int m,
-                  const std::vector<FabricAddress> &addrs)
-        : k(k), m(m), ec(k, m) {
-        CHECK((int)addrs.size() == k + m);
-        for (auto &a : addrs) servers.emplace_back(net, a);
-        printf("Connected to %d servers (k=%d m=%d).\n", k + m, k, m);
-        fflush(stdout);
+    // Coordinator watch connection — receives DEAD notifications.
+    int                                  coord_fd = -1;
+    std::unordered_map<int,int>          reg_idx_to_pos; // reg_idx → servers[] pos
+    std::thread                          watcher_thread;
+
+    ErasureClient(Network &net, const ClusterInfo &info);
+
+    ~ErasureClient() {
+        if (coord_fd >= 0) { shutdown(coord_fd, SHUT_RDWR); close(coord_fd); coord_fd = -1; }
+        if (watcher_thread.joinable()) watcher_thread.join(); // join so thread exits before dead[] is freed
+    }
+
+    void watch_coordinator() {
+        char buf[64];
+        while (true) {
+            int r = recv(coord_fd, buf, sizeof(buf) - 1, 0);
+            if (r <= 0) return;
+            buf[r] = '\0';
+            int reg_idx;
+            if (sscanf(buf, "DEAD %d", &reg_idx) == 1) {
+                auto it = reg_idx_to_pos.find(reg_idx);
+                if (it != reg_idx_to_pos.end()) {
+                    dead[it->second].store(true);
+                    fprintf(stderr, "[client] Server %d (pos %d) declared dead by coordinator\n",
+                            reg_idx, it->second);
+                }
+            }
+        }
     }
 
     bool Put(const std::string &key, const uint8_t *data, size_t data_len) {
-        _ns t0, t1;
+        // Fail fast if any server is known dead — can't store all shards.
+        for (int i = 0; i < k + m; i++) {
+            if (dead[i].load()) {
+                fprintf(stderr, "PUT '%s' failed: server %d is dead\n", key.c_str(), i);
+                return false;
+            }
+        }
+
+        _ns t0;
 
         t0 = _now();
         auto shards = ec.Encode(data, data_len);
@@ -150,8 +186,18 @@ struct ErasureClient {
     std::vector<uint8_t> Get(const std::string &key) {
         _ns t0;
 
-        t0 = _now();
+        // Only send requests to alive servers; pre-populate dead ones as not-found.
+        std::vector<SlotInfoMsg> infos(k + m);
         for (int i = 0; i < k + m; i++) {
+            infos[i].status   = StatusCode::kNotFound;
+            infos[i].shard_idx = (uint8_t)i;
+        }
+
+        t0 = _now();
+        int alive_count = 0;
+        for (int i = 0; i < k + m; i++) {
+            if (dead[i].load()) continue;
+            alive_count++;
             auto &srv      = servers[i];
             auto *req      = (GetRequestMsg *)srv.ctrl_send.data;
             req->type      = MsgType::kGetRequest;
@@ -164,12 +210,13 @@ struct ErasureClient {
                               sizeof(GetRequestMsg) + key.size(),
                               [](Connection &, RdmaOp &) {});
         }
-        for (auto &srv : servers)
-            while (!srv.conn.pending.empty()) srv.conn.Poll();
+        for (int i = 0; i < k + m; i++)
+            if (!dead[i].load())
+                while (!servers[i].conn.pending.empty()) servers[i].conn.Poll();
 
-        int inflight = k + m;
-        std::vector<SlotInfoMsg> infos(k + m);
+        int inflight = alive_count;
         for (int i = 0; i < k + m; i++) {
+            if (dead[i].load()) continue;
             int idx = i;
             servers[i].conn.PostRecv(servers[i].ctrl_recv,
                 [&, idx](Connection &, RdmaOp &op) {
@@ -178,7 +225,8 @@ struct ErasureClient {
                 });
         }
         while (inflight > 0)
-            for (auto &srv : servers) srv.conn.Poll();
+            for (int i = 0; i < k + m; i++)
+                if (!dead[i].load()) servers[i].conn.Poll();
         last_get_phases.ctrl_rtt_ns = _now() - t0;
 
         std::vector<int> to_read;
@@ -259,8 +307,14 @@ struct ErasureClient {
 
 // ── Coordinator discovery ──────────────────────────────────────────────────────
 
-inline std::vector<FabricAddress>
-coord_discover(const char *host, int port, int k, int m) {
+struct ClusterInfo {
+    std::vector<FabricAddress> addrs;
+    std::vector<int>           reg_idxs; // registration index for each addr
+    int k, m;
+    int coord_fd = -1; // kept open for DEAD push notifications
+};
+
+inline ClusterInfo coord_discover(const char *host, int port) {
     addrinfo hints{}, *res;
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -269,19 +323,17 @@ coord_discover(const char *host, int port, int k, int m) {
         fprintf(stderr, "coordinator: getaddrinfo failed for %s\n", host);
         exit(1);
     }
-    int need = k + m;
     for (int attempt = 0; attempt < 60; attempt++) {
+        // LIST connection
         int fd = socket(res->ai_family, res->ai_socktype, 0);
         if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
             fprintf(stderr, "coordinator: connect failed, retrying...\n");
             close(fd); sleep(1); continue;
         }
-        char msg[64];
-        int n = snprintf(msg, sizeof(msg), "LIST %d %d\n", k, m);
-        send(fd, msg, n, 0);
-        std::string resp; char buf[512];
+        send(fd, "LIST\n", 5, 0);
+        std::string resp; char buf[4096];
         while (true) {
-            int r = recv(fd, buf, sizeof(buf)-1, 0);
+            int r = recv(fd, buf, sizeof(buf) - 1, 0);
             if (r <= 0) break;
             buf[r] = '\0'; resp += buf;
             if (resp.find("END\n")  != std::string::npos) break;
@@ -293,21 +345,58 @@ coord_discover(const char *host, int port, int k, int m) {
             fprintf(stderr, "coordinator: %s", resp.c_str());
             sleep(1); continue;
         }
-        std::vector<std::string> strs;
+        // Parse "K <k>", "M <m>", "<reg_idx> <hex_addr>", "END"
+        ClusterInfo info{};
+        info.k = info.m = -1;
         size_t pos = 0;
         while (pos < resp.size()) {
-            size_t nl = resp.find('\n', pos); if (nl == std::string::npos) break;
+            size_t nl = resp.find('\n', pos);
+            if (nl == std::string::npos) break;
             std::string line = resp.substr(pos, nl - pos); pos = nl + 1;
             if (line == "END") break;
-            if (!line.empty()) strs.push_back(line);
+            if (line.substr(0, 2) == "K ") { info.k = std::stoi(line.substr(2)); continue; }
+            if (line.substr(0, 2) == "M ") { info.m = std::stoi(line.substr(2)); continue; }
+            if (!line.empty()) {
+                size_t sp = line.find(' ');
+                if (sp != std::string::npos) {
+                    info.reg_idxs.push_back(std::stoi(line.substr(0, sp)));
+                    info.addrs.push_back(FabricAddress::Parse(line.substr(sp + 1).c_str()));
+                }
+            }
         }
-        if ((int)strs.size() == need) {
+        if (info.k > 0 && info.m >= 0 && (int)info.addrs.size() == info.k + info.m) {
+            fprintf(stderr, "coordinator: cluster k=%d m=%d (%d servers)\n",
+                    info.k, info.m, info.k + info.m);
+            // Open WATCH connection before freeing res
+            int wfd = socket(res->ai_family, res->ai_socktype, 0);
+            if (connect(wfd, res->ai_addr, res->ai_addrlen) == 0) {
+                send(wfd, "WATCH\n", 6, 0);
+                info.coord_fd = wfd;
+                fprintf(stderr, "coordinator: watching for failure notifications\n");
+            } else {
+                fprintf(stderr, "coordinator: WARNING: WATCH connection failed\n");
+                close(wfd);
+            }
             freeaddrinfo(res);
-            std::vector<FabricAddress> addrs;
-            for (auto &s : strs) addrs.push_back(FabricAddress::Parse(s.c_str()));
-            return addrs;
+            return info;
         }
     }
-    fprintf(stderr, "coordinator: timed out waiting for %d servers\n", need);
+    fprintf(stderr, "coordinator: timed out waiting for servers\n");
     exit(1);
+}
+
+// ── ErasureClient constructor (needs ClusterInfo, defined after coord_discover) ─
+
+inline ErasureClient::ErasureClient(Network &net, const ClusterInfo &info)
+    : k(info.k), m(info.m), ec(info.k, info.m), coord_fd(info.coord_fd) {
+    CHECK((int)info.addrs.size() == k + m);
+    dead = std::make_unique<std::atomic<bool>[]>(k + m);
+    for (int i = 0; i < k + m; i++) dead[i].store(false);
+    for (auto &a : info.addrs) servers.emplace_back(net, a);
+    for (int i = 0; i < (int)info.reg_idxs.size(); i++)
+        reg_idx_to_pos[info.reg_idxs[i]] = i;
+    printf("Connected to %d servers (k=%d m=%d).\n", k + m, k, m);
+    fflush(stdout);
+    if (coord_fd >= 0)
+        watcher_thread = std::thread(&ErasureClient::watch_coordinator, this);
 }

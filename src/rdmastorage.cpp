@@ -12,11 +12,11 @@ struct Client {
     std::unique_ptr<Network>      net;
     std::unique_ptr<ErasureClient> ec;
 
-    // Connect via coordinator.
-    Client(const std::string &coord_host, int k, int m, int port = 7777) {
-        auto addrs = coord_discover(coord_host.c_str(), port, k, m);
+    // Connect via coordinator. k and m are assigned automatically.
+    Client(const std::string &coord_host, int port = 7777) {
+        auto info = coord_discover(coord_host.c_str(), port);
         net = std::make_unique<Network>(Network::Open());
-        ec  = std::make_unique<ErasureClient>(*net, k, m, addrs);
+        ec  = std::make_unique<ErasureClient>(*net, info);
     }
 
     void put(const std::string &key, py::bytes data) {
@@ -56,26 +56,34 @@ struct Client {
         return py::make_tuple(p.encode_ns / 1e3, p.ctrl_rtt_ns / 1e3,
                               p.rdma_ns / 1e3);
     }
+
+    // Returns list of server positions (0-indexed) marked dead by coordinator.
+    py::list dead_servers() {
+        py::list result;
+        for (int i = 0; i < ec->k + ec->m; i++)
+            if (ec->dead[i].load())
+                result.append(i);
+        return result;
+    }
 };
 
 PYBIND11_MODULE(rdmastorage, m) {
     m.doc() = "RDMA-backed erasure-coded key-value store";
 
     py::class_<Client>(m, "Client")
-        .def(py::init<const std::string &, int, int, int>(),
+        .def(py::init<const std::string &, int>(),
              py::arg("coord"),
-             py::arg("k"),
-             py::arg("m") = 1,
              py::arg("port") = 7777,
              R"(
 Connect to the storage cluster via the coordinator.
+k and m are assigned automatically based on the number of live servers.
 
 Args:
     coord: hostname or IP of the coordinator (e.g. "node0")
-    k:     number of data shards
-    m:     number of parity shards (default 1)
     port:  coordinator port (default 7777)
 )")
+        .def_property_readonly("k", [](const Client &c){ return c.ec->k; })
+        .def_property_readonly("m", [](const Client &c){ return c.ec->m; })
         .def("put", &Client::put,
              py::arg("key"), py::arg("data"),
              "Store bytes under key.")
@@ -88,5 +96,7 @@ Args:
         .def("last_put_phases", &Client::last_put_phases,
              "Returns (encode_us, ctrl_rtt_us, rdma_write_us, commit_rtt_us) for last PUT.")
         .def("last_get_phases", &Client::last_get_phases,
-             "Returns (decode_us, ctrl_rtt_us, rdma_read_us) for last GET.");
+             "Returns (decode_us, ctrl_rtt_us, rdma_read_us) for last GET.")
+        .def("dead_servers", &Client::dead_servers,
+             "Returns list of server positions marked dead by the coordinator.");
 }

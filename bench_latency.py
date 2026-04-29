@@ -4,7 +4,7 @@ Latency benchmark for rdmastorage.
 Measures put/get latency across object sizes with warmup to avoid cold start.
 
 Usage:
-    python3 bench_latency.py [--coord node0] [-k 2] [-m 1] [--ops 1000]
+    python3 bench_latency.py [--coord node0] [--ops 1000]
 """
 
 import sys
@@ -127,8 +127,6 @@ def main():
     parser = argparse.ArgumentParser(description="rdmastorage latency benchmark")
     parser.add_argument("--coord", default="node0")
     parser.add_argument("--port",  type=int, default=7777)
-    parser.add_argument("-k",      type=int, default=2)
-    parser.add_argument("-m",      type=int, default=1)
     parser.add_argument("--ops",   type=int, default=500, help="ops per (op, size) pair")
     parser.add_argument("--sizes", nargs="+", type=int, default=None,
                         help="object sizes in bytes (default: 256B to 1MB sweep)")
@@ -136,9 +134,9 @@ def main():
 
     sizes = args.sizes if args.sizes else OBJECT_SIZES
 
-    print(f"Connecting to {args.coord}:{args.port}  k={args.k} m={args.m}")
-    client = rdmastorage.Client(args.coord, args.k, args.m, args.port)
-    print(f"Connected. Warmup={WARMUP_OPS} ops, bench={args.ops} ops per cell.\n")
+    print(f"Connecting to {args.coord}:{args.port}")
+    client = rdmastorage.Client(args.coord, args.port)
+    print(f"Connected. k={client.k} m={client.m}  Warmup={WARMUP_OPS} ops, bench={args.ops} ops per cell.\n")
 
     print(f"  {'op':<4}  {'size':>6}  {'avg':>12}  {'p50':>12}  {'p99':>12}  {'p999':>12}  {'bw':>10}")
     print("  " + "-" * 80)

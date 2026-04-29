@@ -41,14 +41,9 @@ echo "=== Building ==="
 cd "$PROJECT_DIR"
 make clean
 make -j"$(nproc)"
+make pymod
 
 echo ""
 echo "=== Build complete ==="
 echo ""
-echo "SERVER (run on each server node):"
-echo "  ./build/server"
-echo ""
-echo "CLIENT (pass hex address printed by each server):"
-echo "  ./build/client <addr0> [<addr1> ...] bench 1000 65536"
-echo ""
-echo "Object sizes to benchmark: 256 4096 65536 262144 1048576"
+echo "See USAGE.md for startup instructions."

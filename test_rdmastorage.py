@@ -117,21 +117,19 @@ def main():
     parser = argparse.ArgumentParser(description="rdmastorage smoke test + bench")
     parser.add_argument("--coord", default="node0", help="coordinator hostname")
     parser.add_argument("--port",  type=int, default=7777)
-    parser.add_argument("-k",      type=int, default=2, help="data shards")
-    parser.add_argument("-m",      type=int, default=1, help="parity shards")
     parser.add_argument("--ops",   type=int, default=500,   help="ops per bench")
     parser.add_argument("--size",  type=int, default=65536, help="object bytes for bench")
     parser.add_argument("--no-bench", action="store_true", help="skip benchmarks")
     args = parser.parse_args()
 
-    print(f"Connecting to coordinator {args.coord}:{args.port}  k={args.k} m={args.m}")
-    client = rdmastorage.Client(args.coord, args.k, args.m, args.port)
-    print("Connected.")
+    print(f"Connecting to coordinator {args.coord}:{args.port}")
+    client = rdmastorage.Client(args.coord, args.port)
+    print(f"Connected. k={client.k} m={client.m}")
 
     test_put_get(client)
     test_overwrite(client)
     test_delete(client)
-    test_large_value(client, args.k)
+    test_large_value(client, client.k)
 
     if not args.no_bench:
         bench_put(client, args.ops, args.size)

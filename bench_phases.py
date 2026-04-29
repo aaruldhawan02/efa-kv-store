@@ -4,7 +4,7 @@ Phase breakdown benchmark for rdmastorage.
 Shows how latency splits across: encode, ctrl RTT, RDMA wire, commit RTT.
 
 Usage:
-    python3 bench_phases.py [--coord node0] [-k 2] [-m 1] [--ops 200] [--size 65536]
+    python3 bench_phases.py [--coord node0] [--ops 200] [--size 65536]
 """
 
 import sys
@@ -112,15 +112,13 @@ def main():
     parser = argparse.ArgumentParser(description="rdmastorage phase breakdown")
     parser.add_argument("--coord", default="node0")
     parser.add_argument("--port",  type=int, default=7777)
-    parser.add_argument("-k",      type=int, default=2)
-    parser.add_argument("-m",      type=int, default=1)
     parser.add_argument("--ops",   type=int, default=200)
     parser.add_argument("--size",  type=int, default=65536)
     args = parser.parse_args()
 
-    print(f"Connecting to {args.coord}:{args.port}  k={args.k} m={args.m}")
-    client = rdmastorage.Client(args.coord, args.k, args.m, args.port)
-    print("Connected.")
+    print(f"Connecting to {args.coord}:{args.port}")
+    client = rdmastorage.Client(args.coord, args.port)
+    print(f"Connected. k={client.k} m={client.m}")
 
     bench_put_phases(client, args.size, args.ops)
     bench_get_phases(client, args.size, args.ops)

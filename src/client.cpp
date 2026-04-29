@@ -92,8 +92,10 @@ static void write_file(const char *path, const std::vector<uint8_t> &data) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s --coord <host[:port]> -k <k> [-m <m>] <mode> [args...]\n"
-        "  %s <addr0> [<addr1>...] [-k <k>] <mode> [args...]\n"
+        "  %s --coord <host[:port]> <mode> [args...]\n"
+        "\n"
+        "  k and m are assigned automatically by the coordinator\n"
+        "  based on the number of live server nodes.\n"
         "\n"
         "  Modes:\n"
         "    putfile <key> <file>        store a file\n"
@@ -104,9 +106,9 @@ static void usage(const char *prog) {
         "    bench <num_ops> <obj_bytes> benchmark put then get\n"
         "\n"
         "Examples:\n"
-        "  %s --coord node0 -k 2 putfile mykey photo.jpg\n"
-        "  %s --coord node0 -k 4 -m 2 bench 10000 65536\n",
-        prog, prog, prog, prog);
+        "  %s --coord node0 putfile mykey photo.jpg\n"
+        "  %s --coord node0 bench 10000 65536\n",
+        prog, prog, prog);
     std::exit(1);
 }
 
@@ -115,9 +117,6 @@ int main(int argc, char **argv) {
 
     const char *coord_host = nullptr;
     int         coord_port = 7777;
-    int         explicit_k = -1;
-    int         explicit_m = -1;
-    std::vector<FabricAddress> addrs;
     int i = 1;
 
     while (i < argc) {
@@ -126,42 +125,19 @@ int main(int argc, char **argv) {
             char *colon = strchr(arg, ':');
             if (colon) { *colon = '\0'; coord_port = atoi(colon + 1); }
             coord_host = arg;
-        } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
-            explicit_k = std::stoi(argv[++i]); i++;
-        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            explicit_m = std::stoi(argv[++i]); i++;
         } else {
-            size_t l = strlen(argv[i]);
-            bool is_hex = (l >= 2 && l % 2 == 0 && l <= 128);
-            for (size_t j = 0; j < l && is_hex; j++)
-                is_hex = isxdigit((unsigned char)argv[i][j]);
-            if (is_hex) { addrs.push_back(FabricAddress::Parse(argv[i])); i++; }
-            else break;
+            break;
         }
     }
 
-    if (i >= argc) usage(argv[0]);
+    if (!coord_host) { fprintf(stderr, "ERROR: --coord is required\n"); usage(argv[0]); }
+    if (i >= argc)   usage(argv[0]);
     std::string mode = argv[i++];
 
-    int k, m;
-    if (coord_host) {
-        if (explicit_k <= 0) { fprintf(stderr, "ERROR: --coord requires -k\n"); usage(argv[0]); }
-        k = explicit_k;
-        m = (explicit_m > 0) ? explicit_m : 1;
-        auto discovered = coord_discover(coord_host, coord_port, k, m);
-        addrs.insert(addrs.end(), discovered.begin(), discovered.end());
-    } else {
-        if (addrs.empty()) { fprintf(stderr, "ERROR: no addresses and no --coord\n"); usage(argv[0]); }
-        int n = (int)addrs.size();
-        if (explicit_k > 0) {
-            k = explicit_k; m = n - k;
-        } else {
-            k = (n > 1) ? n - 1 : 1; m = (n > 1) ? 1 : 0;
-        }
-    }
-
-    auto net = Network::Open();
-    ErasureClient c(net, k, m, addrs);
+    auto info = coord_discover(coord_host, coord_port);
+    auto net  = Network::Open();
+    ErasureClient c(net, info);
+    int k = info.k;
 
     if (mode == "putfile") {
         if (i + 1 >= argc) usage(argv[0]);
