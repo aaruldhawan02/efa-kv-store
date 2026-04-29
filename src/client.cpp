@@ -2,11 +2,15 @@
 #include "ec.hpp"
 #include "protocol.hpp"
 #include <algorithm>
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstdio>
+#include <netdb.h>
 #include <numeric>
 #include <random>
 #include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <vector>
 
 using Clock = std::chrono::high_resolution_clock;
@@ -301,6 +305,73 @@ static void bench_get(ErasureClient &c, size_t num_ops, size_t obj_size) {
     print_latency(lats, "GET", obj_size);
 }
 
+// ── Coordinator discovery ─────────────────────────────────────────────────────
+
+// Query coordinator at host:port for k+m server addresses.
+// Retries until all servers have registered (with a timeout).
+static std::vector<std::string>
+coord_list(const char *host, int port, int k, int m) {
+    addrinfo hints{}, *res;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16]; snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+        fprintf(stderr, "coordinator: getaddrinfo failed for %s\n", host);
+        exit(1);
+    }
+
+    for (int attempt = 0; attempt < 60; attempt++) {
+        int fd = socket(res->ai_family, res->ai_socktype, 0);
+        if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+            fprintf(stderr, "coordinator: connection refused, retrying...\n");
+            close(fd); sleep(1); continue;
+        }
+        char msg[64];
+        int n = snprintf(msg, sizeof(msg), "LIST %d %d\n", k, m);
+        send(fd, msg, n, 0);
+
+        // Read full response
+        std::string resp;
+        char buf[256];
+        while (true) {
+            int r = recv(fd, buf, sizeof(buf)-1, 0);
+            if (r <= 0) break;
+            buf[r] = '\0';
+            resp += buf;
+            if (resp.find("END\n") != std::string::npos) break;
+            if (resp.find("WAIT") != std::string::npos) break;
+            if (resp.find("ERROR") != std::string::npos) break;
+        }
+        close(fd);
+
+        if (resp.substr(0, 4) == "WAIT") {
+            fprintf(stderr, "coordinator: %s", resp.c_str());
+            sleep(1); continue;
+        }
+        if (resp.find("ERROR") != std::string::npos) {
+            fprintf(stderr, "coordinator error: %s\n", resp.c_str()); exit(1);
+        }
+
+        // Parse addresses (one per line, terminated by END)
+        std::vector<std::string> addrs;
+        size_t pos = 0;
+        while (pos < resp.size()) {
+            size_t nl = resp.find('\n', pos);
+            if (nl == std::string::npos) break;
+            std::string line = resp.substr(pos, nl - pos);
+            pos = nl + 1;
+            if (line == "END") break;
+            if (!line.empty()) addrs.push_back(line);
+        }
+        if ((int)addrs.size() == k + m) {
+            freeaddrinfo(res);
+            return addrs;
+        }
+    }
+    fprintf(stderr, "coordinator: timed out waiting for %d servers\n", k + m);
+    exit(1);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 // ── File helpers ──────────────────────────────────────────────────────────────
@@ -330,11 +401,12 @@ static void write_file(const char *path, const std::vector<uint8_t> &data) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <addr0> [<addr1> ...] [-k <k>] <mode> [args...]\n"
+        "Usage:\n"
+        "  # With coordinator (recommended):\n"
+        "  %s --coord <host[:port]> -k <k> <mode> [args...]\n"
         "\n"
-        "  Addresses are hex fabric addresses printed by each server.\n"
-        "  n_servers = k + m.  Default: k = n-1, m = 1.\n"
-        "  Use -k to set k explicitly; m = n_servers - k.\n"
+        "  # With explicit addresses:\n"
+        "  %s <addr0> [<addr1> ...] [-k <k>] <mode> [args...]\n"
         "\n"
         "  Modes:\n"
         "    putfile <key> <file>        store a file\n"
@@ -345,53 +417,109 @@ static void usage(const char *prog) {
         "    bench <num_ops> <obj_bytes> benchmark put then get\n"
         "\n"
         "Examples:\n"
-        "  %s <a0>..<a5> -k 4 putfile mykey photo.jpg\n"
-        "  %s <a0>..<a5> -k 4 getfile mykey out.jpg\n"
-        "  %s <a0>..<a5> -k 4 bench 10000 65536\n",
+        "  %s --coord node0 -k 4 putfile mykey photo.jpg\n"
+        "  %s --coord node0 -k 4 bench 10000 65536\n",
         prog, prog, prog, prog);
     std::exit(1);
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5) usage(argv[0]);
+    if (argc < 3) usage(argv[0]);
 
+    const char *coord_host = nullptr;
+    int         coord_port = 7777;
     std::vector<FabricAddress> addrs;
-    int i = 1;
-    while (i < argc) {
-        size_t l = strlen(argv[i]);
-        if (l < 2 || l % 2 != 0 || l > 128) break;
-        bool is_hex = true;
-        for (size_t j = 0; j < l && is_hex; j++)
-            is_hex = isxdigit((unsigned char)argv[i][j]);
-        if (!is_hex) break;
-        addrs.push_back(FabricAddress::Parse(argv[i]));
-        i++;
-    }
-    if (addrs.empty()) usage(argv[0]);
-
-    // Optional -k flag.
     int explicit_k = -1;
-    if (i < argc && strcmp(argv[i], "-k") == 0) {
-        i++;
-        if (i >= argc) usage(argv[0]);
-        explicit_k = std::stoi(argv[i++]);
+    int i = 1;
+
+    // Parse flags and addresses (flags may appear before/after addresses)
+    while (i < argc) {
+        if (strcmp(argv[i], "--coord") == 0 && i + 1 < argc) {
+            char *arg = argv[++i]; i++;
+            char *colon = strchr(arg, ':');
+            if (colon) { *colon = '\0'; coord_port = atoi(colon + 1); }
+            coord_host = arg;
+        } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+            explicit_k = std::stoi(argv[++i]); i++;
+        } else {
+            // Try to parse as hex fabric address
+            size_t l = strlen(argv[i]);
+            bool is_hex = (l >= 2 && l % 2 == 0 && l <= 128);
+            for (size_t j = 0; j < l && is_hex; j++)
+                is_hex = isxdigit((unsigned char)argv[i][j]);
+            if (is_hex) { addrs.push_back(FabricAddress::Parse(argv[i])); i++; }
+            else break;
+        }
     }
 
     if (i >= argc) usage(argv[0]);
     std::string mode = argv[i++];
 
-    int n = (int)addrs.size();
     int k, m;
-    if (explicit_k > 0) {
-        k = explicit_k;
-        m = n - k;
-        if (m < 0 || k + m != n) {
-            fprintf(stderr, "ERROR: -k %d incompatible with %d servers\n", k, n);
-            std::exit(1);
+    if (coord_host) {
+        // Discover via coordinator — -k is required
+        if (explicit_k <= 0) {
+            fprintf(stderr, "ERROR: --coord requires -k <k>\n"); usage(argv[0]);
         }
+        k = explicit_k;
+        m = 1; // default; coordinator knows the real count
+        // Query coordinator to get k+m (try m=1,2,3 until we get a full list)
+        // For simplicity ask for the addresses and infer m from what comes back.
+        // We'll try LIST k 1, k 2, ... up to k 4.
+        std::vector<std::string> addr_strs;
+        for (int try_m = 1; try_m <= 4 && addr_strs.empty(); try_m++) {
+            char tmp_host[256]; strncpy(tmp_host, coord_host, 255);
+            // Peek: ask coordinator with this m
+            addrinfo hints{}, *res;
+            hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+            char ps[16]; snprintf(ps, sizeof(ps), "%d", coord_port);
+            if (getaddrinfo(tmp_host, ps, &hints, &res) != 0) break;
+            int fd = socket(res->ai_family, res->ai_socktype, 0);
+            if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+                char msg[64]; int mn = snprintf(msg, sizeof(msg), "LIST %d %d\n", k, try_m);
+                send(fd, msg, mn, 0);
+                std::string resp; char buf[512];
+                while (true) {
+                    int r = recv(fd, buf, sizeof(buf)-1, 0); if (r <= 0) break;
+                    buf[r] = '\0'; resp += buf;
+                    if (resp.find("END\n") != std::string::npos ||
+                        resp.find("WAIT") != std::string::npos) break;
+                }
+                close(fd);
+                if (resp.find("END") != std::string::npos) {
+                    size_t pos = 0;
+                    while (pos < resp.size()) {
+                        size_t nl = resp.find('\n', pos); if (nl == std::string::npos) break;
+                        std::string line = resp.substr(pos, nl - pos); pos = nl + 1;
+                        if (line == "END") break;
+                        if (!line.empty()) addr_strs.push_back(line);
+                    }
+                    m = try_m;
+                }
+            } else { close(fd); }
+            freeaddrinfo(res);
+        }
+        if (addr_strs.empty()) {
+            // Fall back to proper blocking call
+            addr_strs = coord_list(coord_host, coord_port, k, 1);
+            m = 1;
+        }
+        for (auto &s : addr_strs)
+            addrs.push_back(FabricAddress::Parse(s.c_str()));
+        m = (int)addrs.size() - k;
     } else {
-        k = (n > 1) ? n - 1 : 1;
-        m = (n > 1) ? 1 : 0;
+        if (addrs.empty()) { fprintf(stderr, "ERROR: no addresses and no --coord\n"); usage(argv[0]); }
+        int nn = (int)addrs.size();
+        if (explicit_k > 0) {
+            k = explicit_k; m = nn - k;
+            if (m < 0 || k + m != nn) {
+                fprintf(stderr, "ERROR: -k %d incompatible with %d servers\n", k, nn);
+                std::exit(1);
+            }
+        } else {
+            k = (nn > 1) ? nn - 1 : 1;
+            m = (nn > 1) ? 1 : 0;
+        }
     }
 
     auto net = Network::Open();

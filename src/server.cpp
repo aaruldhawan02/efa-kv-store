@@ -1,8 +1,12 @@
 #include "common.hpp"
 #include "protocol.hpp"
 #include <algorithm>
+#include <arpa/inet.h>
 #include <inttypes.h>
+#include <netdb.h>
 #include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -82,11 +86,57 @@ struct PoolAlloc {
     }
 };
 
-int main() {
+// Register with coordinator; coordinator auto-assigns and returns shard index.
+static int coord_register(const char *host, int port,
+                           const std::string &hex_addr) {
+    addrinfo hints{}, *res;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16]; snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+        fprintf(stderr, "coordinator: getaddrinfo failed for %s\n", host);
+        return -1;
+    }
+    int fd = socket(res->ai_family, res->ai_socktype, 0);
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        fprintf(stderr, "coordinator: connect to %s:%d failed\n", host, port);
+        close(fd); freeaddrinfo(res); return -1;
+    }
+    freeaddrinfo(res);
+    char msg[512];
+    int n = snprintf(msg, sizeof(msg), "REGISTER %s\n", hex_addr.c_str());
+    send(fd, msg, n, 0);
+    char resp[64] = {};
+    recv(fd, resp, sizeof(resp)-1, 0);
+    close(fd);
+    // Response: "OK <idx>\n"
+    int idx = -1;
+    sscanf(resp, "OK %d", &idx);
+    fprintf(stderr, "Registered as shard %d with coordinator %s:%d\n",
+            idx, host, port);
+    return idx;
+}
+
+int main(int argc, char **argv) {
+    // Optional: --coord <host[:port]>
+    const char *coord_host = nullptr;
+    int         coord_port = 7777;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--coord") == 0 && i + 1 < argc) {
+            char *colon = strchr(argv[++i], ':');
+            if (colon) { *colon = '\0'; coord_port = atoi(colon + 1); }
+            coord_host = argv[i];
+        }
+    }
+
     auto net = Network::Open();
     auto listen_addr = net.Listen();
     printf("address: %s\n", listen_addr.ToString().c_str());
     fflush(stdout);
+
+    if (coord_host)
+        coord_register(coord_host, coord_port, listen_addr.ToString());
 
     Buffer pool      = Buffer::Alloc(kPoolSize);
     Buffer ctrl_recv = Buffer::Alloc(kCtrlBufSize);
