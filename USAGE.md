@@ -197,6 +197,68 @@ python3 bench_latency.py --coord node0 --ops 200
 python3 bench_phases.py --coord node0 --ops 200 --size 65536
 ```
 
+### Configurable workload benchmark
+
+`bench_workload.py` runs named workloads across a range of object sizes and prints latency stats (avg, p50, p95, p99) plus bandwidth. It also prints a per-phase breakdown by default.
+
+```bash
+# Default: put_get workload, sizes 4KB/16KB/64KB/256KB, 200 ops each
+python3 bench_workload.py --coord node0
+
+# PUT-only workload, two sizes, 500 ops
+python3 bench_workload.py --coord node0 --workload put_only --sizes 4096 65536 --ops 500
+
+# PUT → GET → DELETE cycle
+python3 bench_workload.py --coord node0 --workload put_get_delete
+
+# Skip per-phase breakdown (faster output)
+python3 bench_workload.py --coord node0 --no-phases
+```
+
+**Available workloads:**
+
+| Workload | Operations |
+|----------|------------|
+| `put_only` | PUT only |
+| `get_only` | PUT to populate, then GET only |
+| `put_get` | Alternating PUT then GET (default) |
+| `put_get_delete` | PUT → GET → DELETE cycle |
+
+**All flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--coord` | `node0` | Coordinator hostname |
+| `--port` | `7777` | Coordinator port |
+| `--workload` | `put_get` | Workload type |
+| `--sizes BYTES...` | `4096 16384 65536 262144` | Object sizes in bytes |
+| `--ops N` | `200` | Operations per size |
+| `--warmup N` | `20` | Warmup ops per size (excluded from stats) |
+| `--no-phases` | off | Skip per-phase latency breakdown |
+
+**Example output (64KB, put_get workload):**
+
+```
+--- 64KB ---
+  op     size         avg        p50        p95        p99          bw
+  -----------------------------------------------------------------------
+  PUT     64KB  avg=  312.4us  p50=  305.1us  p95=  398.2us  p99=  441.0us   204.9 MB/s
+         phase           avg       p50       p95       p99
+         --------------------------------------------------------
+         encode        12.3us    11.8us    15.2us    17.1us  (4%)
+         ctrl RTT      48.7us    46.2us    61.4us    74.3us  (16%)
+         RDMA write   241.5us   235.0us   312.8us   351.2us  (77%)
+         commit RTT     9.9us     9.4us    13.1us    15.6us  (3%)
+         total        312.4us   302.4us   402.5us   458.2us
+  GET     64KB  avg=  198.6us  p50=  192.3us  p95=  251.7us  p99=  289.4us   322.4 MB/s
+         phase           avg       p50       p95       p99
+         --------------------------------------------------------
+         ctrl RTT      38.1us    36.4us    48.2us    57.9us  (19%)
+         RDMA read    152.3us   147.8us   196.4us   221.7us  (77%)
+         decode         8.2us     7.9us    10.4us    12.3us  (4%)
+         total        198.6us   192.1us   255.0us   291.9us
+```
+
 ### Smoke tests
 
 ```bash
