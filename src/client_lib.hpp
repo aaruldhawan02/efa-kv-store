@@ -3,11 +3,27 @@
 #include "ec.hpp"
 #include "protocol.hpp"
 #include <arpa/inet.h>
+#include <chrono>
 #include <netdb.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+
+using _Clock = std::chrono::high_resolution_clock;
+using _ns    = long long;
+static inline _ns _now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               _Clock::now().time_since_epoch()).count();
+}
+
+struct PhaseTimes {
+    _ns encode_ns       = 0; // ISA-L encode (PUT) or decode (GET)
+    _ns ctrl_rtt_ns     = 0; // control send → grant/info received
+    _ns rdma_ns         = 0; // PostWrite (PUT) or PostRead (GET) → completion
+    _ns commit_rtt_ns   = 0; // commit send → ack received (PUT only)
+};
+
 
 // ── Per-server connection ──────────────────────────────────────────────────────
 
@@ -37,6 +53,8 @@ struct ErasureClient {
     int   k, m;
     ErasureCoder ec;
     std::vector<ServerConn> servers;
+    PhaseTimes last_put_phases;
+    PhaseTimes last_get_phases;
 
     ErasureClient(Network &net, int k, int m,
                   const std::vector<FabricAddress> &addrs)
@@ -48,8 +66,13 @@ struct ErasureClient {
     }
 
     bool Put(const std::string &key, const uint8_t *data, size_t data_len) {
-        auto shards = ec.Encode(data, data_len);
+        _ns t0, t1;
 
+        t0 = _now();
+        auto shards = ec.Encode(data, data_len);
+        last_put_phases.encode_ns = _now() - t0;
+
+        t0 = _now();
         for (int i = 0; i < k + m; i++) {
             auto &srv = servers[i];
             auto *req        = (PutRequestMsg *)srv.ctrl_send.data;
@@ -83,7 +106,9 @@ struct ErasureClient {
         }
         while (inflight > 0)
             for (auto &srv : servers) srv.conn.Poll();
+        last_put_phases.ctrl_rtt_ns = _now() - t0;
 
+        t0 = _now();
         inflight = k + m;
         for (int i = 0; i < k + m; i++) {
             auto &srv = servers[i];
@@ -95,7 +120,9 @@ struct ErasureClient {
         }
         while (inflight > 0)
             for (auto &srv : servers) srv.conn.Poll();
+        last_put_phases.rdma_ns = _now() - t0;
 
+        t0 = _now();
         for (int i = 0; i < k + m; i++) {
             auto &srv    = servers[i];
             auto *commit = (PutCommitMsg *)srv.ctrl_send.data;
@@ -115,11 +142,15 @@ struct ErasureClient {
         }
         while (inflight > 0)
             for (auto &srv : servers) srv.conn.Poll();
+        last_put_phases.commit_rtt_ns = _now() - t0;
 
         return true;
     }
 
     std::vector<uint8_t> Get(const std::string &key) {
+        _ns t0;
+
+        t0 = _now();
         for (int i = 0; i < k + m; i++) {
             auto &srv      = servers[i];
             auto *req      = (GetRequestMsg *)srv.ctrl_send.data;
@@ -148,6 +179,7 @@ struct ErasureClient {
         }
         while (inflight > 0)
             for (auto &srv : servers) srv.conn.Poll();
+        last_get_phases.ctrl_rtt_ns = _now() - t0;
 
         std::vector<int> to_read;
         to_read.reserve(k);
@@ -173,6 +205,7 @@ struct ErasureClient {
         uint32_t object_size = 0;
         inflight = k;
 
+        t0 = _now();
         for (int i : to_read) {
             uint32_t shard_len = infos[i].shard_len;
             servers[i].conn.PostRead(servers[i].data_buf, shard_len,
@@ -188,8 +221,13 @@ struct ErasureClient {
         }
         while (inflight > 0)
             for (int i : to_read) servers[i].conn.Poll();
+        last_get_phases.rdma_ns = _now() - t0;
 
-        return ec.Decode(shards, present, object_size);
+        t0 = _now();
+        auto result = ec.Decode(shards, present, object_size);
+        last_get_phases.encode_ns = _now() - t0;  // decode time
+
+        return result;
     }
 
     void Delete(const std::string &key) {

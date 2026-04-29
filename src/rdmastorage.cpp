@@ -42,6 +42,20 @@ struct Client {
     void delete_(const std::string &key) {
         ec->Delete(key);
     }
+
+    // Returns (encode_us, ctrl_rtt_us, rdma_us, commit_rtt_us) for last PUT.
+    py::tuple last_put_phases() {
+        auto &p = ec->last_put_phases;
+        return py::make_tuple(p.encode_ns / 1e3, p.ctrl_rtt_ns / 1e3,
+                              p.rdma_ns / 1e3,   p.commit_rtt_ns / 1e3);
+    }
+
+    // Returns (decode_us, ctrl_rtt_us, rdma_us) for last GET.
+    py::tuple last_get_phases() {
+        auto &p = ec->last_get_phases;
+        return py::make_tuple(p.encode_ns / 1e3, p.ctrl_rtt_ns / 1e3,
+                              p.rdma_ns / 1e3);
+    }
 };
 
 PYBIND11_MODULE(rdmastorage, m) {
@@ -70,5 +84,9 @@ Args:
              "Retrieve bytes stored under key.")
         .def("delete", &Client::delete_,
              py::arg("key"),
-             "Delete key from all shards.");
+             "Delete key from all shards.")
+        .def("last_put_phases", &Client::last_put_phases,
+             "Returns (encode_us, ctrl_rtt_us, rdma_write_us, commit_rtt_us) for last PUT.")
+        .def("last_get_phases", &Client::last_get_phases,
+             "Returns (decode_us, ctrl_rtt_us, rdma_read_us) for last GET.");
 }
