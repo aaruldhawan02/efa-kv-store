@@ -3,6 +3,7 @@
 #include "protocol.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <numeric>
 #include <random>
 #include <string>
@@ -43,6 +44,10 @@ struct ServerConn {
         conn.RegMem(ctrl_send);
         conn.RegMem(ctrl_recv);
         conn.RegMemRma(data_buf);
+        // Pre-fault all registered pages so first real op doesn't pay page-fault cost.
+        memset(ctrl_send.data, 0, ctrl_send.size);
+        memset(ctrl_recv.data, 0, ctrl_recv.size);
+        memset(data_buf.data,  0, data_buf.size);
     }
 };
 
@@ -140,28 +145,30 @@ struct ErasureClient {
     }
 
     // GET: request slot info → RDMA read shard data → decode
+    // GET: contact all k+m servers, use any k that have the shard.
+    // Tolerates up to m unavailable servers (degraded read).
     std::vector<uint8_t> Get(const std::string &key) {
-        // Phase 1: send GetRequest to k data servers
-        for (int i = 0; i < k; i++) {
-            auto &srv    = servers[i];
-            auto *req    = (GetRequestMsg *)srv.ctrl_send.data;
-            req->type    = MsgType::kGetRequest;
+        // Phase 1: send GetRequest to ALL k+m servers in parallel
+        for (int i = 0; i < k + m; i++) {
+            auto &srv      = servers[i];
+            auto *req      = (GetRequestMsg *)srv.ctrl_send.data;
+            req->type      = MsgType::kGetRequest;
             req->shard_idx = (uint8_t)i;
-            req->_pad[0] = req->_pad[1] = 0;
-            req->key_len = (uint32_t)key.size();
+            req->_pad[0]   = req->_pad[1] = 0;
+            req->key_len   = (uint32_t)key.size();
             memcpy((char *)srv.ctrl_send.data + sizeof(GetRequestMsg),
                    key.data(), key.size());
             srv.conn.PostSend(srv.ctrl_send,
                               sizeof(GetRequestMsg) + key.size(),
                               [](Connection &, RdmaOp &) {});
         }
-        for (int i = 0; i < k; i++)
-            while (!servers[i].conn.pending.empty()) servers[i].conn.Poll();
+        for (auto &srv : servers)
+            while (!srv.conn.pending.empty()) srv.conn.Poll();
 
-        // Phase 2: receive SlotInfo from each server
-        int inflight = k;
+        // Phase 2: receive SlotInfo from ALL k+m servers
+        int inflight = k + m;
         std::vector<SlotInfoMsg> infos(k + m);
-        for (int i = 0; i < k; i++) {
+        for (int i = 0; i < k + m; i++) {
             int idx = i;
             servers[i].conn.PostRecv(servers[i].ctrl_recv,
                 [&, idx](Connection &, RdmaOp &op) {
@@ -170,23 +177,43 @@ struct ErasureClient {
                 });
         }
         while (inflight > 0)
-            for (int i = 0; i < k; i++) servers[i].conn.Poll();
+            for (auto &srv : servers) srv.conn.Poll();
 
-        // Phase 3: RDMA read shard data from each server's slot
+        // Phase 3: pick k available shards — data shards preferred,
+        // fall back to parity shards for degraded reads.
+        std::vector<int> to_read;
+        to_read.reserve(k);
+        for (int i = 0; i < k + m && (int)to_read.size() < k; i++) {
+            if (infos[i].status == StatusCode::kOk)
+                to_read.push_back(i);
+        }
+        if ((int)to_read.size() < k) {
+            fprintf(stderr, "GET '%s' failed: only %zu/%d shards available\n",
+                    key.c_str(), to_read.size(), k);
+            return {};
+        }
+
+        bool degraded = false;
+        for (int i : to_read) {
+            if (infos[i].shard_idx >= (uint8_t)k) { degraded = true; break; }
+        }
+        if (degraded)
+            fprintf(stderr, "degraded read for '%s' (using parity shards)\n",
+                    key.c_str());
+
+        // Phase 4: RDMA read from the chosen k servers in parallel
         std::vector<std::vector<uint8_t>> shards(k + m);
         std::vector<bool>                 present(k + m, false);
         uint32_t object_size = 0;
         inflight = k;
 
-        for (int i = 0; i < k; i++) {
-            CHECK(infos[i].status == StatusCode::kOk);
-            int      idx       = i;
+        for (int i : to_read) {
             uint32_t shard_len = infos[i].shard_len;
             servers[i].conn.PostRead(servers[i].data_buf, shard_len,
                 infos[i].remote_addr, infos[i].rkey,
-                [&, idx, shard_len](Connection &, RdmaOp &op) {
-                    int sidx = infos[idx].shard_idx;
-                    object_size = infos[idx].object_size;
+                [&, i, shard_len](Connection &, RdmaOp &op) {
+                    int sidx = infos[i].shard_idx;
+                    object_size = infos[i].object_size;
                     const uint8_t *sd = (const uint8_t *)op.buf->data;
                     shards[sidx] = std::vector<uint8_t>(sd, sd + shard_len);
                     present[sidx] = true;
@@ -194,7 +221,7 @@ struct ErasureClient {
                 });
         }
         while (inflight > 0)
-            for (int i = 0; i < k; i++) servers[i].conn.Poll();
+            for (int i : to_read) servers[i].conn.Poll();
 
         return ec.Decode(shards, present, object_size);
     }
@@ -276,20 +303,52 @@ static void bench_get(ErasureClient &c, size_t num_ops, size_t obj_size) {
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
+// ── File helpers ──────────────────────────────────────────────────────────────
+
+static std::vector<uint8_t> read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); std::exit(1); }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    std::vector<uint8_t> buf(sz);
+    if (fread(buf.data(), 1, sz, f) != (size_t)sz) {
+        fprintf(stderr, "read error: %s\n", path); std::exit(1);
+    }
+    fclose(f);
+    return buf;
+}
+
+static void write_file(const char *path, const std::vector<uint8_t> &data) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); std::exit(1); }
+    if (fwrite(data.data(), 1, data.size(), f) != data.size()) {
+        fprintf(stderr, "write error: %s\n", path); std::exit(1);
+    }
+    fclose(f);
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <addr0> [<addr1> ...] [-k <k>] <mode> <num_ops> <obj_bytes>\n"
+        "Usage: %s <addr0> [<addr1> ...] [-k <k>] <mode> [args...]\n"
         "\n"
         "  Addresses are hex fabric addresses printed by each server.\n"
-        "  n_servers = k + m (total servers).  Default: k = n-1, m = 1.\n"
+        "  n_servers = k + m.  Default: k = n-1, m = 1.\n"
         "  Use -k to set k explicitly; m = n_servers - k.\n"
         "\n"
-        "  mode: put | get | bench\n"
+        "  Modes:\n"
+        "    putfile <key> <file>        store a file\n"
+        "    getfile <key> <outfile>     retrieve a file\n"
+        "    delkey  <key>               delete a key\n"
+        "    put   <num_ops> <obj_bytes> benchmark puts\n"
+        "    get   <num_ops> <obj_bytes> benchmark gets (pre-populates)\n"
+        "    bench <num_ops> <obj_bytes> benchmark put then get\n"
         "\n"
         "Examples:\n"
-        "  %s <a0> <a1> <a2> bench 1000 65536          # k=2 m=1\n"
-        "  %s <a0>..<a5> -k 4 bench 10000 65536        # k=4 m=2\n",
-        prog, prog, prog);
+        "  %s <a0>..<a5> -k 4 putfile mykey photo.jpg\n"
+        "  %s <a0>..<a5> -k 4 getfile mykey out.jpg\n"
+        "  %s <a0>..<a5> -k 4 bench 10000 65536\n",
+        prog, prog, prog, prog);
     std::exit(1);
 }
 
@@ -318,11 +377,8 @@ int main(int argc, char **argv) {
         explicit_k = std::stoi(argv[i++]);
     }
 
-    if (i + 2 >= argc) usage(argv[0]);
-
-    std::string mode      = argv[i++];
-    size_t      num_ops   = std::stoull(argv[i++]);
-    size_t      obj_bytes = std::stoull(argv[i]);
+    if (i >= argc) usage(argv[0]);
+    std::string mode = argv[i++];
 
     int n = (int)addrs.size();
     int k, m;
@@ -338,21 +394,55 @@ int main(int argc, char **argv) {
         m = (n > 1) ? 1 : 0;
     }
 
-    if (obj_bytes == 0 || obj_bytes > (size_t)k * kMaxShardSize) {
-        fprintf(stderr, "obj_bytes must be 1..%zu\n", (size_t)k * kMaxShardSize);
-        std::exit(1);
-    }
-
     auto net = Network::Open();
     ErasureClient c(net, k, m, addrs);
 
-    if (mode == "put") {
-        bench_put(c, num_ops, obj_bytes);
-    } else if (mode == "get") {
-        bench_get(c, num_ops, obj_bytes);
-    } else if (mode == "bench") {
-        bench_put(c, num_ops, obj_bytes);
-        bench_get(c, num_ops, obj_bytes);
+    if (mode == "putfile") {
+        if (i + 1 >= argc) usage(argv[0]);
+        std::string key  = argv[i++];
+        const char *path = argv[i];
+        auto data = read_file(path);
+        if (data.empty() || data.size() > (size_t)k * kMaxShardSize) {
+            fprintf(stderr, "file size must be 1..%zu bytes\n",
+                    (size_t)k * kMaxShardSize);
+            std::exit(1);
+        }
+        auto t0 = Clock::now();
+        bool ok = c.Put(key, data.data(), data.size());
+        double us = (Clock::now() - t0).count() / 1e3;
+        if (ok) printf("PUT '%s' (%zu bytes) in %.1f us\n", key.c_str(), data.size(), us);
+        else    { fprintf(stderr, "PUT failed\n"); std::exit(1); }
+
+    } else if (mode == "getfile") {
+        if (i + 1 >= argc) usage(argv[0]);
+        std::string key     = argv[i++];
+        const char *outpath = argv[i];
+        auto t0 = Clock::now();
+        auto data = c.Get(key);
+        double us = (Clock::now() - t0).count() / 1e3;
+        if (data.empty()) { fprintf(stderr, "GET failed or key not found\n"); std::exit(1); }
+        write_file(outpath, data);
+        printf("GET '%s' (%zu bytes) in %.1f us → %s\n",
+               key.c_str(), data.size(), us, outpath);
+
+    } else if (mode == "delkey") {
+        if (i >= argc) usage(argv[0]);
+        std::string key = argv[i];
+        c.Delete(key);
+        printf("DEL '%s'\n", key.c_str());
+
+    } else if (mode == "put" || mode == "get" || mode == "bench") {
+        if (i + 1 >= argc) usage(argv[0]);
+        size_t num_ops   = std::stoull(argv[i++]);
+        size_t obj_bytes = std::stoull(argv[i]);
+        if (obj_bytes == 0 || obj_bytes > (size_t)k * kMaxShardSize) {
+            fprintf(stderr, "obj_bytes must be 1..%zu\n", (size_t)k * kMaxShardSize);
+            std::exit(1);
+        }
+        if (mode == "put")        bench_put(c, num_ops, obj_bytes);
+        else if (mode == "get")   bench_get(c, num_ops, obj_bytes);
+        else { bench_put(c, num_ops, obj_bytes); bench_get(c, num_ops, obj_bytes); }
+
     } else {
         usage(argv[0]);
     }

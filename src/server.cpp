@@ -118,15 +118,11 @@ int main() {
     };
 
     // Accept clients in a loop so re-running the client doesn't require
-    // restarting the server.
+    // restarting the server.  State (slots, keys) persists across reconnects
+    // so data stored in one client session is readable in the next.
     for (;;) {
-        for (int i = 0; i < kMaxSlots; i++) slots[i] = SlotEntry{};
-        next_slot = 0;
-        pending_puts.clear();
-        key_to_slot.clear();
-        palloc.reset();
-
-        fprintf(stderr, "Waiting for client connection...\n");
+        fprintf(stderr, "Waiting for client connection... (%zu keys stored)\n",
+                key_to_slot.size());
         Connection conn = net.Accept();
         fprintf(stderr, "Client connected.\n");
 
