@@ -2,19 +2,25 @@
 #include "protocol.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <mutex>
 #include <netdb.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
-// Metadata slots are cheap; pool memory is the real constraint.
-static constexpr int    kMaxSlots = 65536;
-static constexpr size_t kPoolSize = 512u * 1024 * 1024; // 512 MB RDMA pool
+static constexpr int    kMaxSlots        = 65536;
+static constexpr size_t kSlabSize        = 512ULL * 1024 * 1024; // 512 MB per slab
+static constexpr int    kMaxSlabs        = 8;                     // 4 GB total RDMA pool
+static constexpr int    kMaxStagingSlots = 64;                    // 64 MB staging area
+static constexpr size_t kDiskPoolSize    = 64ULL * 1024 * 1024 * 1024; // 64 GB disk cap
+static const char      *kDiskFile        = "/tmp/rdma-kv-spill.bin";
 
 static std::string shard_key(const char *key, size_t klen, uint8_t shard_idx) {
     std::string s(key, klen);
@@ -23,11 +29,15 @@ static std::string shard_key(const char *key, size_t klen, uint8_t shard_idx) {
     return s;
 }
 
+// ── SlotEntry ─────────────────────────────────────────────────────────────────
+
 struct SlotEntry {
     bool     in_use      = false;
+    uint8_t  slab_id     = 0;    // which RDMA slab (ignored when on_disk)
+    bool     on_disk     = false; // true when shard was spilled to NVMe
     uint32_t shard_len   = 0;
     uint32_t object_size = 0;
-    uint64_t pool_off    = 0; // byte offset within pool buffer
+    uint64_t pool_off    = 0;    // byte offset within slab or disk file
 };
 
 struct PendingPut {
@@ -35,26 +45,31 @@ struct PendingPut {
     uint32_t    shard_len;
     uint32_t    object_size;
     uint64_t    pool_off;
+    uint8_t     slab_id;
+    bool        on_disk;
+    int         staging_slot; // staging slot used for disk PUT (-1 if RDMA)
 };
 
-// Free-list allocator over a contiguous pool buffer.
+// ── Free-list allocator ───────────────────────────────────────────────────────
+// Variable-size: alloc(len) allocates exactly len bytes, not a fixed slot size.
+
 struct PoolAlloc {
     struct Block { uint64_t off; uint32_t len; };
     std::vector<Block> free_list;
     uint64_t           pool_size;
+    uint64_t           bytes_free;
 
-    explicit PoolAlloc(uint64_t sz) : pool_size(sz) {
-        free_list.push_back({0, (uint32_t)sz});
+    explicit PoolAlloc(uint64_t sz) : pool_size(sz), bytes_free(sz) {
+        free_list.push_back({0, (uint32_t)std::min(sz, (uint64_t)UINT32_MAX)});
     }
 
-    // First-fit allocation; returns offset or UINT64_MAX on failure.
     uint64_t alloc(uint32_t len) {
         for (auto it = free_list.begin(); it != free_list.end(); ++it) {
             if (it->len >= len) {
                 uint64_t off = it->off;
-                if (it->len == len)
-                    free_list.erase(it);
+                if (it->len == len) free_list.erase(it);
                 else { it->off += len; it->len -= len; }
+                bytes_free -= len;
                 return off;
             }
         }
@@ -66,26 +81,61 @@ struct PoolAlloc {
         auto it = std::lower_bound(free_list.begin(), free_list.end(), b,
             [](const Block &a, const Block &x){ return a.off < x.off; });
         it = free_list.insert(it, b);
-        // Merge with successor.
         auto nxt = std::next(it);
         if (nxt != free_list.end() && it->off + it->len == nxt->off) {
-            it->len += nxt->len;
-            free_list.erase(nxt);
+            it->len += nxt->len; free_list.erase(nxt);
         }
-        // Merge with predecessor.
         if (it != free_list.begin()) {
             auto prv = std::prev(it);
             if (prv->off + prv->len == it->off) {
-                prv->len += it->len;
-                free_list.erase(it);
+                prv->len += it->len; free_list.erase(it);
             }
         }
+        bytes_free += len;
+    }
+};
+
+// ── Multi-slab RDMA allocator ─────────────────────────────────────────────────
+// Grows lazily: starts with one 512 MB slab; adds more when needed (up to 8).
+// All methods must be called under SharedState::mu.
+
+struct MultiSlabAlloc {
+    struct Slab {
+        Buffer    buf;
+        PoolAlloc palloc;
+        Slab() : buf(Buffer::Alloc(kSlabSize)), palloc(kSlabSize) {}
+        Slab(Slab &&o) = default;
+    };
+    std::vector<Slab> slabs;
+
+    struct AllocResult { uint8_t slab_id; uint64_t offset; bool ok; };
+
+    MultiSlabAlloc() { slabs.emplace_back(); } // start with one slab
+
+    AllocResult alloc(uint32_t len) {
+        for (size_t i = 0; i < slabs.size(); i++) {
+            uint64_t off = slabs[i].palloc.alloc(len);
+            if (off != UINT64_MAX) return {(uint8_t)i, off, true};
+        }
+        if ((int)slabs.size() >= kMaxSlabs) return {0, 0, false};
+        fprintf(stderr, "[server] RDMA pool full — allocating slab #%zu (%.0f GB total)\n",
+                slabs.size(), (slabs.size() + 1) * kSlabSize / 1e9);
+        slabs.emplace_back();
+        uint8_t id = (uint8_t)(slabs.size() - 1);
+        uint64_t off = slabs[id].palloc.alloc(len);
+        return {id, off, off != UINT64_MAX};
     }
 
-    void reset() {
-        free_list.clear();
-        free_list.push_back({0, (uint32_t)pool_size});
+    void free(uint8_t slab_id, uint64_t off, uint32_t len) {
+        slabs[slab_id].palloc.free(off, len);
     }
+
+    uint64_t bytes_used() const {
+        uint64_t free_bytes = 0;
+        for (auto &s : slabs) free_bytes += s.palloc.bytes_free;
+        return slabs.size() * kSlabSize - free_bytes;
+    }
+    uint64_t bytes_total() const { return slabs.size() * kSlabSize; }
 };
 
 // ── Shared state across all client threads ────────────────────────────────────
@@ -95,15 +145,52 @@ struct SharedState {
     SlotEntry                            slots[kMaxSlots];
     int                                  next_slot = 0;
     std::unordered_map<std::string, int> key_to_slot;
-    PoolAlloc                            palloc;
+    MultiSlabAlloc                       multi_slab;
 
-    explicit SharedState() : palloc(kPoolSize) {}
+    // Staging buffer: pre-registered RDMA memory used as a bridge for disk shards.
+    // On disk PUT: client RDMA-writes shard here; server copies to disk, then frees slot.
+    // On disk GET: server reads from disk here; client RDMA-reads, then sends DiskRelease.
+    Buffer                               staging_buf;
+    std::atomic<bool>                    staging_in_use[kMaxStagingSlots];
+
+    // Disk spill (activated when all RDMA slabs are exhausted)
+    int       disk_fd    = -1;
+    PoolAlloc disk_alloc;
+
+    explicit SharedState()
+        : staging_buf(Buffer::Alloc((size_t)kMaxStagingSlots * kMaxShardSize)),
+          disk_alloc(kDiskPoolSize) {
+        for (int i = 0; i < kMaxStagingSlots; i++) staging_in_use[i].store(false);
+        disk_fd = open(kDiskFile, O_RDWR | O_CREAT, 0600);
+        if (disk_fd < 0) {
+            perror("open disk spill file");
+            std::exit(1);
+        }
+    }
 };
 
-// Background thread: keeps coordinator TCP connection alive by responding to
-// PING messages with PONG. The coordinator uses this for failure detection.
-static void coord_keepalive(int fd) {
-    char buf[32];
+// ── Staging slot allocator (lock-free spin) ───────────────────────────────────
+
+static int alloc_staging_slot(SharedState &shared) {
+    for (;;) {
+        for (int i = 0; i < kMaxStagingSlots; i++) {
+            bool expected = false;
+            if (shared.staging_in_use[i].compare_exchange_weak(expected, true,
+                    std::memory_order_acquire, std::memory_order_relaxed))
+                return i;
+        }
+        std::this_thread::yield();
+    }
+}
+
+static void free_staging_slot(SharedState &shared, int idx) {
+    shared.staging_in_use[idx].store(false, std::memory_order_release);
+}
+
+// ── Coordinator keepalive ─────────────────────────────────────────────────────
+
+static void coord_keepalive(int fd, SharedState &shared) {
+    char buf[64];
     while (true) {
         int r = recv(fd, buf, sizeof(buf) - 1, 0);
         if (r <= 0) {
@@ -112,13 +199,22 @@ static void coord_keepalive(int fd) {
             return;
         }
         buf[r] = '\0';
-        if (strncmp(buf, "PING", 4) == 0)
-            send(fd, "PONG\n", 5, MSG_NOSIGNAL);
+        if (strncmp(buf, "PING", 4) == 0) {
+            size_t keys, bytes_used, bytes_total;
+            {
+                std::lock_guard<std::mutex> lk(shared.mu);
+                keys        = shared.key_to_slot.size();
+                bytes_used  = shared.multi_slab.bytes_used();
+                bytes_total = shared.multi_slab.bytes_total();
+            }
+            char resp[128];
+            snprintf(resp, sizeof(resp), "PONG %zu %zu %zu\n",
+                     keys, bytes_used, bytes_total);
+            send(fd, resp, strlen(resp), MSG_NOSIGNAL);
+        }
     }
 }
 
-// Register with coordinator; returns the persistent fd (caller must not close).
-// Coordinator auto-assigns and returns shard index.
 static int coord_register(const char *host, int port,
                            const std::string &hex_addr) {
     addrinfo hints{}, *res;
@@ -140,37 +236,59 @@ static int coord_register(const char *host, int port,
     send(fd, msg, n, 0);
     char resp[64] = {};
     recv(fd, resp, sizeof(resp) - 1, 0);
-    // Response: "OK <idx>\n"
     int idx = -1;
     sscanf(resp, "OK %d", &idx);
     fprintf(stderr, "Registered as shard %d with coordinator %s:%d\n",
             idx, host, port);
-    // Keep fd open — coordinator will send PINGs on it
     return fd;
 }
 
 // ── Per-client thread ─────────────────────────────────────────────────────────
 
-static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
+static void handle_client(Connection conn, SharedState &shared) {
+    // Per-connection control buffers.
     Buffer ctrl_recv = Buffer::Alloc(kCtrlBufSize);
     Buffer ctrl_send = Buffer::Alloc(kCtrlBufSize);
-
-    // Each connection registers the shared pool independently; multiple MRs
-    // over the same memory region is valid in RDMA — each gets its own rkey.
-    conn.RegMemRma(pool);
     conn.RegMem(ctrl_recv);
     conn.RegMem(ctrl_send);
 
-    uint64_t pool_rkey = conn.RKey(pool);
-    uint64_t pool_base = conn.VAddr(pool);
+    // Register staging buffer for this connection (one MR per connection).
+    conn.RegMemRma(shared.staging_buf);
+    uint64_t staging_rkey = conn.RKey(shared.staging_buf);
+    uint64_t staging_base = conn.VAddr(shared.staging_buf);
+
+    // Per-connection tracking of registered RDMA slab MRs.
+    // New slabs added by other threads are registered lazily here before use.
+    struct SlabConn { uint64_t rkey; uint64_t base_addr; };
+    std::vector<SlabConn> slab_conns;
+
+    // Register all currently existing slabs and any new ones that appear.
+    auto ensure_slabs_registered = [&]() {
+        // Called under shared.mu by the caller (PutRequest path), or separately.
+        while (slab_conns.size() < shared.multi_slab.slabs.size()) {
+            auto &slab = shared.multi_slab.slabs[slab_conns.size()];
+            conn.RegMemRma(slab.buf);
+            slab_conns.push_back({conn.RKey(slab.buf), conn.VAddr(slab.buf)});
+            fprintf(stderr, "[server] Registered slab #%zu for new connection\n",
+                    slab_conns.size() - 1);
+        }
+    };
+
+    // Initial registration under the lock.
+    {
+        std::lock_guard<std::mutex> lk(shared.mu);
+        ensure_slabs_registered();
+    }
 
     uint64_t ops_put = 0, ops_get = 0, ops_del = 0;
 
-    // pending_puts tracks PutRequest → PutCommit within this one connection.
-    // It is never shared, so no lock is needed to access it.
+    // pending_puts is per-connection: tracks PutRequest→PutCommit within one client.
     std::unordered_map<uint32_t, PendingPut> pending_puts;
 
-    // alloc_slot and free_slot must be called while holding shared.mu.
+    // Staging slots allocated by this connection (for cleanup on disconnect).
+    std::vector<int> my_staging_slots;
+
+    // free_slot and alloc_slot must be called under shared.mu.
     auto alloc_slot = [&shared]() -> int {
         for (int i = 0; i < kMaxSlots; i++) {
             int s = (shared.next_slot + i) % kMaxSlots;
@@ -184,10 +302,15 @@ static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
     };
 
     auto free_slot = [&shared](int s) {
-        if (shared.slots[s].in_use) {
-            shared.palloc.free(shared.slots[s].pool_off, shared.slots[s].shard_len);
-            shared.slots[s] = SlotEntry{};
+        if (!shared.slots[s].in_use) return;
+        if (shared.slots[s].on_disk) {
+            shared.disk_alloc.free(shared.slots[s].pool_off, shared.slots[s].shard_len);
+        } else {
+            shared.multi_slab.free(shared.slots[s].slab_id,
+                                   shared.slots[s].pool_off,
+                                   shared.slots[s].shard_len);
         }
+        shared.slots[s] = SlotEntry{};
     };
 
     bool running = true;
@@ -206,15 +329,22 @@ static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
         auto *raw  = (const uint8_t *)ctrl_recv.data;
         auto  type = (MsgType)raw[0];
 
+        // ── PutRequest ───────────────────────────────────────────────────────
         if (type == MsgType::kPutRequest) {
             auto *req = (const PutRequestMsg *)raw;
             const char *key = (const char *)(raw + sizeof(PutRequestMsg));
             auto sk = shard_key(key, req->key_len, req->shard_idx);
 
-            int slot; uint64_t pool_off;
+            int      slot;
+            uint8_t  slab_id   = 0;
+            uint64_t pool_off  = 0;
+            bool     spill     = false;
+            int      stg_slot  = -1;
+
             {
                 std::lock_guard<std::mutex> lk(shared.mu);
-                // Free the old slot for this shard key if it exists.
+
+                // Free old slot for this shard key if overwriting.
                 auto it = shared.key_to_slot.find(sk);
                 if (it != shared.key_to_slot.end()) {
                     free_slot(it->second);
@@ -227,39 +357,79 @@ static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
                     std::exit(1);
                 }
 
-                pool_off = shared.palloc.alloc(req->shard_len);
-                if (pool_off == UINT64_MAX) {
-                    fprintf(stderr, "ERROR: pool memory exhausted\n");
-                    std::exit(1);
+                auto r = shared.multi_slab.alloc(req->shard_len);
+                // Register any slabs created by alloc() (including new ones just grown).
+                ensure_slabs_registered();
+                if (r.ok) {
+                    slab_id  = r.slab_id;
+                    pool_off = r.offset;
+                } else {
+                    // All RDMA slabs full — spill to disk.
+                    pool_off = shared.disk_alloc.alloc(req->shard_len);
+                    if (pool_off == UINT64_MAX) {
+                        fprintf(stderr, "ERROR: disk pool exhausted\n");
+                        std::exit(1);
+                    }
+                    spill = true;
+                    fprintf(stderr, "[server] Spilling shard to disk at offset %" PRIu64 "\n",
+                            pool_off);
                 }
                 shared.slots[slot].pool_off = pool_off;
+                shared.slots[slot].slab_id  = spill ? 0 : slab_id;
             }
 
-            // pending_puts is per-thread; no lock needed.
-            pending_puts[slot] = {sk, req->shard_len, req->object_size, pool_off};
+            // For disk spill: client writes to a staging slot; server copies to disk after commit.
+            // For RDMA: client writes directly to the slab.
+            uint64_t grant_addr;
+            uint64_t grant_rkey;
 
-            auto *grant        = (SlotGrantMsg *)ctrl_send.data;
-            grant->type        = MsgType::kSlotGrant;
+            if (spill) {
+                stg_slot   = alloc_staging_slot(shared);
+                grant_addr = staging_base + (uint64_t)stg_slot * kMaxShardSize;
+                grant_rkey = staging_rkey;
+            } else {
+                grant_addr = slab_conns[slab_id].base_addr + pool_off;
+                grant_rkey = slab_conns[slab_id].rkey;
+            }
+
+            pending_puts[slot] = {sk, req->shard_len, req->object_size,
+                                  pool_off, slab_id, spill, stg_slot};
+
+            auto *grant     = (SlotGrantMsg *)ctrl_send.data;
+            grant->type     = MsgType::kSlotGrant;
             memset(grant->_pad, 0, sizeof(grant->_pad));
             grant->slot_idx    = (uint32_t)slot;
-            grant->remote_addr = pool_base + pool_off;
-            grant->rkey        = pool_rkey;
+            grant->remote_addr = grant_addr;
+            grant->rkey        = grant_rkey;
 
             bool done = false;
             conn.PostSend(ctrl_send, sizeof(SlotGrantMsg),
                           [&done](Connection &, RdmaOp &) { done = true; });
             while (!done) conn.Poll();
 
+        // ── PutCommit ────────────────────────────────────────────────────────
         } else if (type == MsgType::kPutCommit) {
             auto *commit = (const PutCommitMsg *)raw;
             auto  it     = pending_puts.find(commit->slot_idx);
             CHECK(it != pending_puts.end());
-
             auto &pp = it->second;
+
+            if (pp.on_disk) {
+                // Client wrote to staging buffer; copy to disk now.
+                uint64_t stg_off = (uint64_t)pp.staging_slot * kMaxShardSize;
+                ssize_t w = pwrite(shared.disk_fd,
+                                   (const char *)shared.staging_buf.data + stg_off,
+                                   pp.shard_len, (off_t)pp.pool_off);
+                if (w != (ssize_t)pp.shard_len)
+                    fprintf(stderr, "[server] pwrite error: %s\n", strerror(errno));
+                free_staging_slot(shared, pp.staging_slot);
+            }
+
             {
                 std::lock_guard<std::mutex> lk(shared.mu);
                 shared.slots[commit->slot_idx].shard_len   = pp.shard_len;
                 shared.slots[commit->slot_idx].object_size = pp.object_size;
+                shared.slots[commit->slot_idx].on_disk     = pp.on_disk;
                 shared.key_to_slot[pp.sk]                  = commit->slot_idx;
             }
             pending_puts.erase(it);
@@ -276,6 +446,7 @@ static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
                           [&done](Connection &, RdmaOp &) { done = true; });
             while (!done) conn.Poll();
 
+        // ── GetRequest ───────────────────────────────────────────────────────
         } else if (type == MsgType::kGetRequest) {
             auto *req = (const GetRequestMsg *)raw;
             const char *key = (const char *)(raw + sizeof(GetRequestMsg));
@@ -284,9 +455,13 @@ static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
             uint64_t   addr = 0, rkey = 0;
             uint32_t   shard_len = 0, object_size = 0;
             StatusCode status;
+            uint8_t    on_disk_flag   = 0;
+            uint32_t   stg_slot_idx   = 0;
 
             {
                 std::lock_guard<std::mutex> lk(shared.mu);
+                // Ensure any new slabs (added since last check) are registered.
+                ensure_slabs_registered();
                 auto it = shared.key_to_slot.find(sk);
                 if (it == shared.key_to_slot.end()) {
                     status = StatusCode::kNotFound;
@@ -295,27 +470,61 @@ static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
                     status      = StatusCode::kOk;
                     shard_len   = shared.slots[slot].shard_len;
                     object_size = shared.slots[slot].object_size;
-                    addr        = pool_base + shared.slots[slot].pool_off;
-                    rkey        = pool_rkey;
+
+                    if (shared.slots[slot].on_disk) {
+                        on_disk_flag = 1;
+                    } else {
+                        uint8_t sid = shared.slots[slot].slab_id;
+                        addr = slab_conns[sid].base_addr + shared.slots[slot].pool_off;
+                        rkey = slab_conns[sid].rkey;
+                    }
                     ++ops_get;
                 }
             }
 
-            auto *info      = (SlotInfoMsg *)ctrl_send.data;
-            info->type      = MsgType::kSlotInfo;
-            info->shard_idx = req->shard_idx;
-            info->_pad      = 0;
-            info->status    = status;
+            if (status == StatusCode::kOk && on_disk_flag) {
+                // Read disk shard into a staging slot; client will RDMA-read from there.
+                int stg = alloc_staging_slot(shared);
+                my_staging_slots.push_back(stg);
+                stg_slot_idx = (uint32_t)stg;
+
+                uint64_t stg_off = (uint64_t)stg * kMaxShardSize;
+                // disk_alloc offset was stored in pool_off; retrieve it under the lock.
+                uint64_t disk_off = 0;
+                {
+                    std::lock_guard<std::mutex> lk(shared.mu);
+                    auto it = shared.key_to_slot.find(sk);
+                    if (it != shared.key_to_slot.end())
+                        disk_off = shared.slots[it->second].pool_off;
+                }
+                ssize_t r = pread(shared.disk_fd,
+                                  (char *)shared.staging_buf.data + stg_off,
+                                  shard_len, (off_t)disk_off);
+                if (r != (ssize_t)shard_len)
+                    fprintf(stderr, "[server] pread error: %s\n", strerror(errno));
+
+                addr = staging_base + stg_off;
+                rkey = staging_rkey;
+            }
+
+            auto *info        = (SlotInfoMsg *)ctrl_send.data;
+            info->type        = MsgType::kSlotInfo;
+            info->shard_idx   = req->shard_idx;
+            info->on_disk     = on_disk_flag;
+            info->_pad2        = 0;
+            info->status      = status;
             info->shard_len   = shard_len;
             info->object_size = object_size;
             info->remote_addr = addr;
             info->rkey        = rkey;
+            info->staging_slot_idx = stg_slot_idx;
 
             bool done = false;
             conn.PostSend(ctrl_send, sizeof(SlotInfoMsg),
                           [&done](Connection &, RdmaOp &) { done = true; });
             while (!done) conn.Poll();
 
+        // ── DelRequest ───────────────────────────────────────────────────────
         } else if (type == MsgType::kDelRequest) {
             auto *req = (const DelRequestMsg *)raw;
             const char *key = (const char *)(raw + sizeof(DelRequestMsg));
@@ -346,35 +555,55 @@ static void handle_client(Connection conn, Buffer &pool, SharedState &shared) {
                           [&done](Connection &, RdmaOp &) { done = true; });
             while (!done) conn.Poll();
 
+        // ── DiskRelease ──────────────────────────────────────────────────────
+        } else if (type == MsgType::kDiskRelease) {
+            auto *rel = (const DiskReleaseMsg *)raw;
+            free_staging_slot(shared, (int)rel->staging_slot_idx);
+            // Remove from our tracking list.
+            auto &v = my_staging_slots;
+            v.erase(std::remove(v.begin(), v.end(), (int)rel->staging_slot_idx), v.end());
+            // No reply needed.
+
         } else {
             fprintf(stderr, "unknown msg type %d\n", (int)type);
         }
 
         uint64_t total = ops_put + ops_get + ops_del;
         if (total > 0 && total % 10000 == 0) {
-            size_t keys;
-            { std::lock_guard<std::mutex> lk(shared.mu); keys = shared.key_to_slot.size(); }
+            size_t keys, mb_used, mb_total;
+            {
+                std::lock_guard<std::mutex> lk(shared.mu);
+                keys     = shared.key_to_slot.size();
+                mb_used  = (size_t)(shared.multi_slab.bytes_used() >> 20);
+                mb_total = (size_t)(shared.multi_slab.bytes_total() >> 20);
+            }
             printf("stats: put=%" PRIu64 " get=%" PRIu64 " del=%" PRIu64
-                   " keys=%zu\n", ops_put, ops_get, ops_del, keys);
+                   " keys=%zu pool=%zuMB/%zuMB\n",
+                   ops_put, ops_get, ops_del, keys, mb_used, mb_total);
+            fflush(stdout);
         }
     }
 
-    // Reclaim any slots that were granted but never committed (client died mid-PUT).
+    // Release any staging slots still held (e.g., client disconnected before DiskRelease).
+    for (int s : my_staging_slots) free_staging_slot(shared, s);
+
+    // Reclaim slots allocated but never committed (client died mid-PUT).
     {
         std::lock_guard<std::mutex> lk(shared.mu);
-        for (auto &[slot_idx, pp] : pending_puts)
+        for (auto &[slot_idx, pp] : pending_puts) {
+            if (pp.staging_slot >= 0)
+                free_staging_slot(shared, pp.staging_slot);
             free_slot(slot_idx);
+        }
     }
 
     fprintf(stderr, "Client disconnected (put=%" PRIu64 " get=%" PRIu64
             " del=%" PRIu64 ").\n", ops_put, ops_get, ops_del);
-    // conn destructor closes endpoint and frees all MRs for this connection.
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
-    // Optional: --coord <host[:port]>
     const char *coord_host = nullptr;
     int         coord_port = 7777;
 
@@ -391,28 +620,32 @@ int main(int argc, char **argv) {
     printf("address: %s\n", listen_addr.ToString().c_str());
     fflush(stdout);
 
+    SharedState shared;
+
     if (coord_host) {
         int coord_fd = coord_register(coord_host, coord_port, listen_addr.ToString());
         if (coord_fd >= 0)
-            std::thread(coord_keepalive, coord_fd).detach();
+            std::thread([coord_fd, &shared]() {
+                coord_keepalive(coord_fd, shared);
+            }).detach();
     }
-
-    Buffer      pool(Buffer::Alloc(kPoolSize));
-    SharedState shared;
 
     for (;;) {
         {
-            size_t keys;
-            { std::lock_guard<std::mutex> lk(shared.mu); keys = shared.key_to_slot.size(); }
-            fprintf(stderr, "Waiting for client connection... (%zu keys stored)\n", keys);
+            size_t keys, mb_used, mb_total;
+            {
+                std::lock_guard<std::mutex> lk(shared.mu);
+                keys     = shared.key_to_slot.size();
+                mb_used  = (size_t)(shared.multi_slab.bytes_used() >> 20);
+                mb_total = (size_t)(shared.multi_slab.bytes_total() >> 20);
+            }
+            fprintf(stderr, "Waiting for client... (%zu keys, pool %zuMB/%zuMB)\n",
+                    keys, mb_used, mb_total);
         }
-        Connection conn = net.Accept();  // only called from main thread — no race on net's EQ
+        Connection conn = net.Accept();
         fprintf(stderr, "Client connected.\n");
-
-        // Detach: the server runs forever; threads outlive no join point.
-        // Lambda capture moves conn (move-only) into the closure explicitly.
-        std::thread([c = std::move(conn), &pool, &shared]() mutable {
-            handle_client(std::move(c), pool, shared);
+        std::thread([c = std::move(conn), &shared]() mutable {
+            handle_client(std::move(c), shared);
         }).detach();
     }
 }

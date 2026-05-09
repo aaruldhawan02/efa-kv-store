@@ -255,16 +255,28 @@ struct ErasureClient {
 
         t0 = _now();
         for (int i : to_read) {
-            uint32_t shard_len = infos[i].shard_len;
+            uint32_t shard_len   = infos[i].shard_len;
+            bool     on_disk     = infos[i].on_disk != 0;
+            uint32_t staging_idx = infos[i].staging_slot_idx;
             servers[i].conn.PostRead(servers[i].data_buf, shard_len,
                 infos[i].remote_addr, infos[i].rkey,
-                [&, i, shard_len](Connection &, RdmaOp &op) {
+                [&, i, shard_len, on_disk, staging_idx](Connection &, RdmaOp &op) {
                     int sidx = infos[i].shard_idx;
                     object_size = infos[i].object_size;
                     const uint8_t *sd = (const uint8_t *)op.buf->data;
                     shards[sidx] = std::vector<uint8_t>(sd, sd + shard_len);
                     present[sidx] = true;
                     --inflight;
+                    // Release the server's staging slot so it can be reused.
+                    if (on_disk) {
+                        auto *rel = (DiskReleaseMsg *)servers[i].ctrl_send.data;
+                        rel->type             = MsgType::kDiskRelease;
+                        rel->_pad[0] = rel->_pad[1] = rel->_pad[2] = 0;
+                        rel->staging_slot_idx = staging_idx;
+                        servers[i].conn.PostSend(servers[i].ctrl_send,
+                                                 sizeof(DiskReleaseMsg),
+                                                 [](Connection &, RdmaOp &) {});
+                    }
                 });
         }
         while (inflight > 0)

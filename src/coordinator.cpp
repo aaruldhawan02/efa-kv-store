@@ -21,8 +21,11 @@ struct ServerEntry {
     int         idx;
     std::string hex_addr;
     int         fd;
-    bool        alive   = true;
-    int         missed  = 0;
+    bool        alive       = true;
+    int         missed      = 0;
+    size_t      keys        = 0;
+    size_t      bytes_used  = 0;
+    size_t      bytes_total = 0;
 };
 
 static std::mutex                 g_mu;
@@ -80,12 +83,19 @@ static void ping_server(int idx) {
             tv.tv_sec  = kPingTimeoutMs / 1000;
             tv.tv_usec = (kPingTimeoutMs % 1000) * 1000;
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            char buf[16] = {};
-            int  r       = recv(fd, buf, sizeof(buf) - 1, 0);
+            char buf[128] = {};
+            int  r        = recv(fd, buf, sizeof(buf) - 1, 0);
             if (r > 0 && strncmp(buf, "PONG", 4) == 0) {
+                size_t keys = 0, used = 0, total = 0;
+                sscanf(buf, "PONG %zu %zu %zu", &keys, &used, &total);
                 std::lock_guard<std::mutex> lk(g_mu);
                 auto it = g_servers.find(idx);
-                if (it != g_servers.end()) it->second.missed = 0;
+                if (it != g_servers.end()) {
+                    it->second.missed      = 0;
+                    it->second.keys        = keys;
+                    it->second.bytes_used  = used;
+                    it->second.bytes_total = total;
+                }
                 continue;
             }
         }
@@ -219,9 +229,15 @@ int main(int argc, char **argv) {
                                " k=" + std::to_string(k) +
                                " m=" + std::to_string(m) + "\n";
             for (auto &[i, s] : g_servers) {
+                size_t mb_used  = s.bytes_used  >> 20;
+                size_t mb_total = s.bytes_total >> 20;
                 resp += "  shard " + std::to_string(i) +
                         (s.alive ? " [alive]" : " [dead]") +
-                        ": " + s.hex_addr.substr(0, 16) + "...\n";
+                        " keys=" + std::to_string(s.keys) +
+                        " pool=" + std::to_string(mb_used) + "/" +
+                                   std::to_string(mb_total) + "MB" +
+                        (mb_total > 0 && mb_used * 100 / mb_total > 80 ? " [HIGH]" : "") +
+                        "\n";
             }
             send(cli, resp.c_str(), resp.size(), 0);
             close(cli);
