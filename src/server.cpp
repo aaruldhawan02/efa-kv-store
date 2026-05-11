@@ -20,7 +20,11 @@ static constexpr size_t kSlabSize        = 512ULL * 1024 * 1024; // 512 MB per s
 static constexpr int    kMaxSlabs        = 8;                     // 4 GB total RDMA pool
 static constexpr int    kMaxStagingSlots = 64;                    // 64 MB staging area
 static constexpr size_t kDiskPoolSize    = 64ULL * 1024 * 1024 * 1024; // 64 GB disk cap
-static const char      *kDiskFile        = "/tmp/rdma-kv-spill.bin";
+static std::string      kDiskFileStr     = ([](){
+    const char *h = getenv("HOME");
+    return std::string(h ? h : "/tmp") + "/rdma-kv-spill.bin";
+})();
+static const char      *kDiskFile        = kDiskFileStr.c_str();
 
 static std::string shard_key(const char *key, size_t klen, uint8_t shard_idx) {
     std::string s(key, klen);
