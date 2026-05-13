@@ -224,7 +224,7 @@ def phase_run(client, props, records, ops, value, rng, warmup_frac):
 CSV_FIELDS = [
     'backend', 'workload', 'servers', 'k', 'm', 'threads',
     'value_bytes', 'record_count', 'op_count',
-    'throughput_ops', 'p50_us', 'p95_us', 'p99_us',
+    'throughput_ops', 'avg_us', 'p95_us', 'p99_us',
     'run_id', 'notes',
 ]
 
@@ -314,7 +314,7 @@ def main():
         'record_count': records,
         'op_count': measured,
         'throughput_ops': round(thr, 2),
-        'p50_us': round(pcts['p50'], 2),
+        'avg_us': round(sum(all_lats) / len(all_lats), 2) if all_lats else 0.0,
         'p95_us': round(pcts['p95'], 2),
         'p99_us': round(pcts['p99'], 2),
         'run_id': run_id,

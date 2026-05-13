@@ -15,8 +15,8 @@ Show how RDMAStorage scales across cluster size and workload mix, and how it sta
 
 | Backend | Servers | Workloads | Ops/run | Records | Value size |
 |---|---|---|---|---|---|
-| RDMAStorage | 1, 2, 3, 4, 5, 6 | A, B, C, D, F | 10,000 | 100,000 | 1 KB |
-| S3 Express  | n/a | A, B, C, D, F | 10,000 | 100,000 | 1 KB |
+| RDMAStorage | 1, 2, 3, 4, 5, 6 | A, B, C, D, F | 10,000 | 50,000 | 1 KB |
+| S3 Express  | n/a | A, B, C, D, F | 10,000 | 50,000 | 1 KB |
 
 Total RDMAStorage cells: 6 × 5 = 30. Budget ~5–10 min/cell → 3–5 hours wall clock.
 
@@ -48,7 +48,7 @@ The throughput-vs-N curve mixes two effects: more parallel servers *and* a diffe
 Each run appends one row to `results/runs.csv`:
 
 ```
-backend,workload,servers,k,m,threads,value_bytes,record_count,op_count,throughput_ops,p50_us,p95_us,p99_us,run_id,notes
+backend,workload,servers,k,m,threads,value_bytes,record_count,op_count,throughput_ops,avg_us,p95_us,p99_us,run_id,notes
 ```
 
 - `backend` ∈ {`rdmastorage`, `s3express`}
@@ -113,7 +113,7 @@ make JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 ycsb
 
 ## Drop the binding into a stock YCSB install
 
-YCSB doesn't need to be rebuilt — drop the JAR onto its classpath and tell the JVM where the JNI `.so` lives:
+YCSB doesn't need to be rebuilt, but the upstream 0.17.0 release needs three small one-time tweaks: the wrapper script is Python 2, it doesn't know about our binding name, and it expects each binding's JAR to live in its own subdirectory.
 
 ```bash
 # One-time: download stock YCSB
@@ -121,13 +121,43 @@ wget https://github.com/brianfrankcooper/YCSB/releases/download/0.17.0/ycsb-0.17
 tar xzf ycsb-0.17.0.tar.gz
 export YCSB_HOME=$PWD/ycsb-0.17.0
 
-# Make our binding visible
-cp benchmarks/binding/rdmastorage/target/rdmastorage-binding-0.1.0.jar $YCSB_HOME/lib/
+# (1) The bin/ycsb wrapper is Python 2 only. Install py2 and pin the shebang.
+sudo apt update && sudo apt install -y python2.7
+sudo sed -i '1c #!/usr/bin/env python2.7' $YCSB_HOME/bin/ycsb
+
+# (2) Register "rdmastorage" in the wrapper's DATABASES dict so it accepts the
+#     short name as a positional arg (the wrapper rejects FQCNs).
+sudo sed -i '/^DATABASES = {/a\    "rdmastorage"     : "site.ycsb.db.rdmastorage.RdmaStorageClient",' $YCSB_HOME/bin/ycsb
+
+# (3) The wrapper looks for binding JARs at $YCSB_HOME/<name>-binding/lib/*.jar.
+mkdir -p $YCSB_HOME/rdmastorage-binding/lib
+cp benchmarks/binding/rdmastorage/target/rdmastorage-binding-0.1.0.jar \
+   $YCSB_HOME/rdmastorage-binding/lib/
+
+# Tell the JVM and the dynamic linker where our native libs are.
 export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH
 export JAVA_OPTS="-Djava.library.path=$PWD/build"
 ```
 
 `LD_LIBRARY_PATH` is so the JNI `.so` can find `libfabric.so` and `libisal.so` at load time. `java.library.path` is so the JVM finds `librdmastorage_jni.so` for `System.loadLibrary("rdmastorage_jni")`.
+
+If you'd rather not edit the wrapper, you can bypass it entirely:
+
+```bash
+JAR=$PWD/benchmarks/binding/rdmastorage/target/rdmastorage-binding-0.1.0.jar
+java -Djava.library.path=$PWD/build \
+     -cp "$YCSB_HOME/lib/*:$JAR" \
+     site.ycsb.Client -load \
+     -db site.ycsb.db.rdmastorage.RdmaStorageClient \
+     -P $YCSB_HOME/workloads/workloada \
+     ...
+```
+
+`-load` runs the load phase, `-t` runs the transaction phase — that's what the wrapper translates to under the hood.
+
+## Why `-XX:TieredStopAtLevel=1`
+
+The HotSpot C2 (server) JIT compiler in OpenJDK 11 generates code that causes a stack-corruption SIGSEGV when invoking our JNI methods through `DBWrapper` — observed via gdb as a return address overwritten with a JVM heap pointer. C1 (the simpler client compiler) does not trigger the bug. `-XX:TieredStopAtLevel=1` keeps JIT enabled but stops at level 1 (C1 only), avoiding C2's aggressive optimizations. Performance impact in our measurements: C1-only is ~2× faster than `-Xint` and within a small constant of the fully-optimized path. The full investigation lives in TODO; for the benchmark numbers the C1-only flag is in effect.
 
 ## Cluster layout
 
@@ -149,14 +179,22 @@ Bring up:
 
 Wait for the coordinator to print `alive=N → k=K m=M`. Verify against the table above.
 
+Make sure `$N` is set and the output dir exists:
+
+```bash
+mkdir -p benchmarks/results/raw
+export N=6   # match the live server count
+```
+
 Load phase (insert the dataset):
 
 ```bash
 # node0
-$YCSB_HOME/bin/ycsb load site.ycsb.db.rdmastorage.RdmaStorageClient \
+$YCSB_HOME/bin/ycsb load rdmastorage \
+    -jvm-args="-XX:TieredStopAtLevel=1 -XX:ErrorFile=/tmp/hs_err_%p.log" \
     -P $YCSB_HOME/workloads/workloada \
     -p rdmastorage.coord=node0 \
-    -p recordcount=100000 \
+    -p recordcount=50000 \
     -p fieldcount=1 \
     -p fieldlength=1024 \
     -threads 1 \
@@ -166,7 +204,8 @@ $YCSB_HOME/bin/ycsb load site.ycsb.db.rdmastorage.RdmaStorageClient \
 Run phase:
 
 ```bash
-$YCSB_HOME/bin/ycsb run site.ycsb.db.rdmastorage.RdmaStorageClient \
+$YCSB_HOME/bin/ycsb run rdmastorage \
+    -jvm-args="-XX:TieredStopAtLevel=1 -XX:ErrorFile=/tmp/hs_err_%p.log" \
     -P $YCSB_HOME/workloads/workloada \
     -p rdmastorage.coord=node0 \
     -p operationcount=10000 \
@@ -202,8 +241,8 @@ for N in 1 2 3 4 5 6; do
     bring_up_cluster $N
     wait_for_alive_count $N
     for W in a b c d f; do
-        $YCSB_HOME/bin/ycsb load $CLASS -P workload$W ... >  raw/rdma_${W}_N${N}_load.log
-        $YCSB_HOME/bin/ycsb run  $CLASS -P workload$W ... > raw/rdma_${W}_N${N}_run.log
+        $YCSB_HOME/bin/ycsb load rdmastorage -P workload$W ... >  raw/rdma_${W}_N${N}_load.log
+        $YCSB_HOME/bin/ycsb run  rdmastorage -P workload$W ... > raw/rdma_${W}_N${N}_run.log
         python3 benchmarks/parse_ycsb_output.py raw/rdma_${W}_N${N}_run.log \
             --backend rdmastorage --workload $W --servers $N >> results/runs.csv
     done
@@ -269,7 +308,7 @@ Directory-bucket naming: `<name>--<az>--x-s3`.
     -p s3.bucket=rdma-baseline--use1-az5--x-s3 \
     -p s3.region=us-east-1 \
     -p s3.endpoint=https://s3express-use1-az5.us-east-1.amazonaws.com \
-    -p recordcount=100000 \
+    -p recordcount=50000 \
     -p fieldcount=1 \
     -p fieldlength=1024 \
     -threads 16 -s 2>&1 | tee results/raw/s3_A_load.log
