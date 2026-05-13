@@ -56,7 +56,7 @@ backend,workload,servers,k,m,threads,value_bytes,record_count,op_count,throughpu
 - `run_id` is a timestamp like `20260512T1402`
 - `notes` records context — `ec2-in-az`, `cloudlab-wan`, threading mode, etc.
 
-A small `parse_ycsb_output.py` (to be added) converts each YCSB stdout summary into one CSV row.
+[parse_ycsb_output.py](parse_ycsb_output.py) converts each YCSB stdout summary into one CSV row.
 
 ## Plotting plan
 
@@ -234,21 +234,42 @@ For the primary numbers, run `-threads 1` (latency-bound) and `-threads 16` (thr
 
 ## Sweep script
 
-`benchmarks/run_matrix.sh` (to be added) does the full 6×5 sweep:
+[benchmarks/run_matrix.sh](run_matrix.sh) does the full 6×5 sweep: for each `N` and workload, tears down the cluster, brings up the coordinator + N servers, runs load + run, parses the run log via [parse_ycsb_output.py](parse_ycsb_output.py), and appends one row to `results/runs.csv`.
+
+### Configuring the cluster
+
+**Edit [benchmarks/cluster.conf](cluster.conf) before your first run.** It ships with `<nodeN>` placeholders — replace each one with the FQDN from your current CloudLab allocation:
 
 ```bash
-for N in 1 2 3 4 5 6; do
-    bring_up_cluster $N
-    wait_for_alive_count $N
-    for W in a b c d f; do
-        $YCSB_HOME/bin/ycsb load rdmastorage -P workload$W ... >  raw/rdma_${W}_N${N}_load.log
-        $YCSB_HOME/bin/ycsb run  rdmastorage -P workload$W ... > raw/rdma_${W}_N${N}_run.log
-        python3 benchmarks/parse_ycsb_output.py raw/rdma_${W}_N${N}_run.log \
-            --backend rdmastorage --workload $W --servers $N >> results/runs.csv
-    done
-    tear_down_cluster
-done
+COORD_NODE=hp046.utah.cloudlab.us
+SERVER_NODES="hp076.utah.cloudlab.us hp064.utah.cloudlab.us ..."
 ```
+
+The same hostnames appear in [scripts/cluster.kdl](../scripts/cluster.kdl) — keep them in sync. Whenever you re-instantiate the experiment on CloudLab, update both files; nothing in the scripts themselves changes.
+
+### Running
+
+```bash
+cd ~/RDMA-Distributed-KV-Store
+bash benchmarks/run_matrix.sh
+```
+
+Subset overrides via env vars (handy for smoke-testing):
+
+```bash
+# single cell
+NS_TO_RUN="3" WORKLOADS="a" bash benchmarks/run_matrix.sh
+
+# a couple of cluster sizes
+NS_TO_RUN="1 3 6" bash benchmarks/run_matrix.sh
+
+# different op count
+OPS=1000 bash benchmarks/run_matrix.sh
+```
+
+### SSH prerequisites
+
+`run_matrix.sh` ssh's into each `SERVER_NODES` entry to start `./build/server`. First-run host-key prompts are auto-accepted via `StrictHostKeyChecking=accept-new`. Make sure passwordless ssh from `node0` to the storage nodes works — CloudLab usually sets this up automatically.
 
 ## Tips and gotchas
 
@@ -362,6 +383,7 @@ The Python harness writes its summary in the same CSV schema as YCSB output, but
 | `workloads/` | Optional local copy of YCSB workload property files |
 | `results/raw/` | Raw YCSB stdout logs |
 | `results/runs.csv` | Aggregated rows for plotting |
-| `parse_ycsb_output.py` | YCSB stdout → CSV row converter (to be added) |
-| `run_matrix.sh` | 6×5 sweep wrapper (to be added) |
+| `cluster.conf` | Hostnames + per-cluster overrides (sourced by `run_matrix.sh`) |
+| `parse_ycsb_output.py` | YCSB stdout → one CSV row |
+| `run_matrix.sh` | 6×5 sweep wrapper |
 | `plot.py` | Renders the three charts from `runs.csv` (to be added) |

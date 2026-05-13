@@ -23,7 +23,18 @@
 
 set -u
 
-REPO=${REPO:-$HOME/RDMA-Distributed-KV-Store}
+# Resolve REPO from this script's location so the script works no matter
+# where it's invoked from.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}
+
+# Source cluster.conf (hostnames + per-cluster overrides) if present.
+CLUSTER_CONF=$SCRIPT_DIR/cluster.conf
+if [ -f "$CLUSTER_CONF" ]; then
+    # shellcheck disable=SC1090
+    source "$CLUSTER_CONF"
+fi
+
 YCSB_HOME=${YCSB_HOME:-$REPO/ycsb-0.17.0}
 COORD_NODE=${COORD_NODE:-node0}
 SERVER_NODES=(${SERVER_NODES:-node1 node2 node3 node4 node5 node6})
@@ -48,7 +59,7 @@ tear_down() {
     log "tear_down: killing coordinator + servers"
     pkill -9 -f build/coordinator 2>/dev/null || true
     for node in "${SERVER_NODES[@]}"; do
-        ssh -o ConnectTimeout=5 -o BatchMode=yes "$node" \
+        ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" \
             "pkill -9 -f build/server 2>/dev/null" </dev/null &
     done
     wait
@@ -67,7 +78,7 @@ bring_up() {
     log "bring_up: $N server(s)"
     for i in $(seq 0 $((N - 1))); do
         local node=${SERVER_NODES[$i]}
-        ssh -o ConnectTimeout=5 -o BatchMode=yes "$node" \
+        ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" \
             "cd $REPO && nohup ./build/server --coord $COORD_NODE > server.log 2>&1 &" \
             </dev/null &
     done
