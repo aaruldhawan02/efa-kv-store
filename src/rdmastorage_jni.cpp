@@ -7,6 +7,8 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -48,10 +50,25 @@ Java_site_ycsb_db_rdmastorage_RdmaStorageClient_ncInit(
 JNIEXPORT void JNICALL
 Java_site_ycsb_db_rdmastorage_RdmaStorageClient_ncClose(
         JNIEnv *, jclass, jlong handle) {
-    // FIXME(2026-05-13): ~ErasureClient triggers a SIGSEGV during libfabric
-    // resource teardown after a fully successful workload. Leaking the handle
-    // is safe for YCSB's short-lived per-cell JVMs — the OS reclaims fds, MRs,
-    // and memory on process exit. Remove once the destructor bug is fixed.
+    // Stop the watcher thread cleanly. We can't let it outlive this call —
+    // if we leak the whole RdmaClient, the JVM eventually unloads our .so at
+    // exit and the watcher (still in recv) segfaults returning to a
+    // now-unmapped code page.
+    auto *c = reinterpret_cast<RdmaClient *>(handle);
+    if (c && c->ec) {
+        if (c->ec->coord_fd >= 0) {
+            shutdown(c->ec->coord_fd, SHUT_RDWR);
+            close(c->ec->coord_fd);
+            c->ec->coord_fd = -1;
+        }
+        if (c->ec->watcher_thread.joinable()) {
+            c->ec->watcher_thread.join();
+        }
+    }
+    // FIXME(2026-05-13): full ~ErasureClient teardown (libfabric MR/EP/domain
+    // closes) triggers a separate SIGSEGV. Skip the delete for now — OS
+    // reclaims fds, MRs, and memory on process exit. Remove once destructor
+    // bug is debugged.
     (void)handle;
 }
 
