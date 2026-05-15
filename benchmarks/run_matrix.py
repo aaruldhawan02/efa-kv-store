@@ -192,8 +192,9 @@ def run_cell(n, workload):
     run_log  = f'{raw}/rdma_{wu}_N{n}_run.log'
 
     def ycsb_cmd(phase, op_arg, log_path):
-        # histogram.percentiles makes the [READ]/[UPDATE]/etc. summary blocks
-        # emit 50/90/95/99 percentile lines (default is just 95,99).
+        # YCSB 0.17 defaults to measurementtype=hdrhistogram, which reads its
+        # percentile list from hdrhistogram.percentiles (default 95,99).
+        # histogram.percentiles is not a real YCSB property.
         return (
             f'cd {REPO_REMOTE} && mkdir -p {raw} && '
             f'export LD_LIBRARY_PATH={BUILD_REMOTE}:$LD_LIBRARY_PATH && '
@@ -203,7 +204,7 @@ def run_cell(n, workload):
             f'-p rdmastorage.coord={COORD_NODE} '
             f'-p recordcount={RECORDS} {op_arg} '
             f'-p fieldcount=1 -p fieldlength={VALUE_BYTES} '
-            f'-p histogram.percentiles=50,90,95,99 '
+            f'-p hdrhistogram.percentiles=50,90,95,99 '
             f'-threads {THREADS} -s 2>&1 | tee {log_path} >/dev/null'
         )
 
