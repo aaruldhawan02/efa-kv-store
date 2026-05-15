@@ -7,18 +7,20 @@ Real YCSB driving both RDMAStorage (via a JNI binding in this repo) and S3 Expre
 Show how RDMAStorage scales across cluster size and workload mix, and how it stacks up against a commercial low-latency object store.
 
 - **Workloads**: A, B, C, D, F (skip E — RDMAStorage has no scans)
-- **Cluster size sweep**: 1, 2, 3, 4, 5, 6 storage servers
+- **Cluster size sweep**: 2, 3, 4, 5, 6 storage servers (the coordinator requires ≥ 2 live servers; see [coordinator.cpp:200](../src/coordinator.cpp#L200))
 - **Baseline**: S3 Express One Zone, single-AZ, run from an in-AZ EC2 client
-- **Output**: a single `results/runs.csv`, plotted by `plot.py`
+- **Output**: a single `results/runs.csv`, plotted by [plot.py](plot.py)
+
+Each cell is run by hand. After every run-phase log lands in `results/raw/`, [parse_ycsb_output.py](parse_ycsb_output.py) appends a row to `results/runs.csv` — workload and N are inferred from the filename and (k, m) come from the canonical policy table, so the only flag you typically need is the log path. Re-run with `--scan results/raw/` at any time to rebuild the CSV from every log on disk.
 
 ## Run matrix
 
 | Backend | Servers | Workloads | Ops/run | Records | Value size |
 |---|---|---|---|---|---|
-| RDMAStorage | 1, 2, 3, 4, 5, 6 | A, B, C, D, F | 10,000 | 50,000 | 1 KB |
+| RDMAStorage | 2, 3, 4, 5, 6 | A, B, C, D, F | 10,000 | 50,000 | 1 KB |
 | S3 Express  | n/a | A, B, C, D, F | 10,000 | 50,000 | 1 KB |
 
-Total RDMAStorage cells: 6 × 5 = 30. Budget ~5–10 min/cell → 3–5 hours wall clock.
+Total RDMAStorage cells: 5 × 5 = 25. Budget ~5–10 min/cell → 2–4 hours wall clock.
 
 ### Why skip Workload E
 
@@ -34,7 +36,6 @@ The coordinator picks erasure-code parameters from the live server count:
 
 | N | k | m | Tolerates |
 |---|---|---|---|
-| 1 | 1 | 0 | 0 |
 | 2 | 2 | 0 | 0 |
 | 3 | 2 | 1 | 1 |
 | 4 | 3 | 1 | 1 |
@@ -62,7 +63,7 @@ backend,workload,servers,k,m,threads,value_bytes,record_count,op_count,throughpu
 
 Three charts from the single CSV, emitted as PNGs into `results/`:
 
-1. **Throughput vs. server count** — X: N (1–6), Y: ops/sec, one line per workload {A,B,C,D,F}. RDMAStorage only. Annotate each marker with (k, m).
+1. **Throughput vs. server count** — X: N (2–6), Y: ops/sec, one line per workload {A,B,C,D,F}. RDMAStorage only. Annotate each marker with (k, m).
 2. **p99 latency vs. server count** — same shape, Y: p99 µs.
 3. **RDMAStorage vs S3 Express** — grouped bar per workload, RDMAStorage@N=6 vs S3 Express. Two bars per workload. Label each bar with p99.
 
@@ -163,7 +164,7 @@ The HotSpot C2 (server) JIT compiler in OpenJDK 11 generates code that causes a 
 
 **node0 = coordinator + YCSB client.** **node1..nodeN = storage servers.** Putting the client on the coordinator node keeps the data path symmetric across all servers and avoids loopback RDMA skew.
 
-## Single-cell procedure
+## Running a cell
 
 Bring up:
 
@@ -179,11 +180,12 @@ Bring up:
 
 Wait for the coordinator to print `alive=N → k=K m=M`. Verify against the table above.
 
-Make sure `$N` is set and the output dir exists:
+Make sure `$N` is set, the workload letter `$W` is set, and the output dir exists:
 
 ```bash
 mkdir -p benchmarks/results/raw
 export N=6   # match the live server count
+export W=a Wu=A   # workload letter: lowercase for the YCSB path, uppercase for the log name
 ```
 
 Load phase (insert the dataset):
@@ -192,13 +194,13 @@ Load phase (insert the dataset):
 # node0
 $YCSB_HOME/bin/ycsb load rdmastorage \
     -jvm-args="-XX:TieredStopAtLevel=1 -XX:ErrorFile=/tmp/hs_err_%p.log" \
-    -P $YCSB_HOME/workloads/workloada \
+    -P $YCSB_HOME/workloads/workload$W \
     -p rdmastorage.coord=node0 \
     -p recordcount=50000 \
     -p fieldcount=1 \
     -p fieldlength=1024 \
     -threads 1 \
-    -s 2>&1 | tee benchmarks/results/raw/rdma_A_N${N}_load.log
+    -s 2>&1 | tee benchmarks/results/raw/rdma_${Wu}_N${N}_load.log
 ```
 
 Run phase:
@@ -206,14 +208,22 @@ Run phase:
 ```bash
 $YCSB_HOME/bin/ycsb run rdmastorage \
     -jvm-args="-XX:TieredStopAtLevel=1 -XX:ErrorFile=/tmp/hs_err_%p.log" \
-    -P $YCSB_HOME/workloads/workloada \
+    -P $YCSB_HOME/workloads/workload$W \
     -p rdmastorage.coord=node0 \
     -p operationcount=10000 \
     -p fieldcount=1 \
     -p fieldlength=1024 \
     -threads 1 \
-    -s 2>&1 | tee benchmarks/results/raw/rdma_A_N${N}_run.log
+    -s 2>&1 | tee benchmarks/results/raw/rdma_${Wu}_N${N}_run.log
 ```
+
+Append a row to `results/runs.csv`. Workload, server count, and (k, m) are all inferred from the filename and the canonical policy table — no extra flags needed for the default config:
+
+```bash
+python3 benchmarks/parse_ycsb_output.py benchmarks/results/raw/rdma_${Wu}_N${N}_run.log
+```
+
+If you departed from the defaults (1 thread, 1024-byte values, 50k records, 10k ops), pass the right values explicitly — e.g. `--threads 16 --value-bytes 4096 --notes ec2-in-az`.
 
 Tear down between cells:
 
@@ -226,50 +236,46 @@ pkill -f build/coordinator
 
 Always tear down — a stale server registration leaves indices misaligned and the next run will silently use the wrong k/m.
 
+## Driving the matrix from outside the cluster
+
+If you'd rather run the whole sweep unattended from your laptop (or any host with ssh access to the cluster), [run_matrix.py](run_matrix.py) does it. For each `(N, workload)` cell it ssh's into the coordinator + first N server nodes, starts the processes, waits for `alive=N`, runs `ycsb load` + `ycsb run` on the coord, parses the run log, and scp's `runs.csv` and `raw/` back to `benchmarks/results/` on the controller at the end.
+
+Edit the `CONFIG` block at the top of the script for your cluster (host aliases or FQDNs, `REPO_REMOTE`, `YCSB_REMOTE`). Then:
+
+```bash
+python3 benchmarks/run_matrix.py                       # full 6x5 sweep
+python3 benchmarks/run_matrix.py --ns "3 6" --workloads "a c"
+python3 benchmarks/run_matrix.py --threads 16 --ops 50000
+python3 benchmarks/run_matrix.py --pull                # just scp results back
+```
+
+Prereqs on the controller: passwordless ssh (key-based or ssh-agent) to every host in the `COORD_NODE` / `SERVER_NODES` config. Nothing else — no cluster-side script changes.
+
+## Rebuilding the CSV from all logs
+
+After running several cells (or if you want to drop bad runs), regenerate `results/runs.csv` from every `*_run.log` in `results/raw/`:
+
+```bash
+python3 benchmarks/parse_ycsb_output.py --scan benchmarks/results/raw
+```
+
+This sorts by `(backend, servers, workload)` and overwrites the CSV. Filenames are the source of truth, so keep the naming convention: `rdma_<W>_N<N>_run.log` for RDMAStorage and `s3_<W>_run.log` for S3 Express.
+
+## Plotting
+
+Once `results/runs.csv` exists, render the three charts:
+
+```bash
+python3 benchmarks/plot.py
+```
+
+PNGs land in `results/`: `throughput_vs_n.png`, `p99_vs_n.png`, `rdma_vs_s3.png`. The third one is only emitted if the CSV has both RDMAStorage and S3 Express rows for at least one shared workload.
+
 ## Threading and concurrency
 
 YCSB's `-threads N` creates N worker threads, each with its own `RdmaStorageClient` instance (so N separate libfabric connections). Verify that `ErasureClient` is safe to instantiate concurrently — if not, run `-threads 1` per process and spawn multiple YCSB processes with disjoint key ranges instead.
 
 For the primary numbers, run `-threads 1` (latency-bound) and `-threads 16` (throughput-bound). Report both rows in the CSV.
-
-## Sweep script
-
-[benchmarks/run_matrix.sh](run_matrix.sh) does the full 6×5 sweep: for each `N` and workload, tears down the cluster, brings up the coordinator + N servers, runs load + run, parses the run log via [parse_ycsb_output.py](parse_ycsb_output.py), and appends one row to `results/runs.csv`.
-
-### Configuring the cluster
-
-**Edit [benchmarks/cluster.conf](cluster.conf) before your first run.** It ships with `<nodeN>` placeholders — replace each one with the FQDN from your current CloudLab allocation:
-
-```bash
-COORD_NODE=hp046.utah.cloudlab.us
-SERVER_NODES="hp076.utah.cloudlab.us hp064.utah.cloudlab.us ..."
-```
-
-The same hostnames appear in [scripts/cluster.kdl](../scripts/cluster.kdl) — keep them in sync. Whenever you re-instantiate the experiment on CloudLab, update both files; nothing in the scripts themselves changes.
-
-### Running
-
-```bash
-cd ~/RDMA-Distributed-KV-Store
-bash benchmarks/run_matrix.sh
-```
-
-Subset overrides via env vars (handy for smoke-testing):
-
-```bash
-# single cell
-NS_TO_RUN="3" WORKLOADS="a" bash benchmarks/run_matrix.sh
-
-# a couple of cluster sizes
-NS_TO_RUN="1 3 6" bash benchmarks/run_matrix.sh
-
-# different op count
-OPS=1000 bash benchmarks/run_matrix.sh
-```
-
-### SSH prerequisites
-
-`run_matrix.sh` ssh's into each `SERVER_NODES` entry to start `./build/server`. First-run host-key prompts are auto-accepted via `StrictHostKeyChecking=accept-new`. Make sure passwordless ssh from `node0` to the storage nodes works — CloudLab usually sets this up automatically.
 
 ## Tips and gotchas
 
@@ -344,7 +350,12 @@ Directory-bucket naming: `<name>--<az>--x-s3`.
     -threads 16 -s 2>&1 | tee results/raw/s3_A_run.log
 ```
 
-The final summary block contains `[OVERALL]`, `[READ]`, `[UPDATE]` etc. with `Throughput(ops/sec)`, `AverageLatency`, `95thPercentileLatency`, `99thPercentileLatency` — `parse_ycsb_output.py` converts that into a CSV row.
+The final summary block contains `[OVERALL]`, `[READ]`, `[UPDATE]` etc. with `Throughput(ops/sec)`, `AverageLatency`, `95thPercentileLatency`, `99thPercentileLatency` — `parse_ycsb_output.py` converts that into a CSV row. The `s3_` prefix triggers the `s3express` backend and sets `servers/k/m` to `N/A`:
+
+```bash
+python3 benchmarks/parse_ycsb_output.py benchmarks/results/raw/s3_A_run.log \
+    --threads 16 --notes ec2-in-az
+```
 
 ## Concurrency
 
@@ -380,10 +391,8 @@ The Python harness writes its summary in the same CSV schema as YCSB output, but
 | `README.md` | This document |
 | `binding/rdmastorage/` | Maven module + Java DB class for real YCSB |
 | `bench_ycsb.py` | Python dev-loop harness (not the benchmark of record) |
-| `workloads/` | Optional local copy of YCSB workload property files |
+| `parse_ycsb_output.py` | YCSB stdout → one CSV row, with a `--scan` mode that rebuilds `runs.csv` from `results/raw/` |
+| `run_matrix.py` | Controller-side matrix driver — ssh's into the cluster and runs every cell |
+| `plot.py` | Renders the three charts from `runs.csv` |
 | `results/raw/` | Raw YCSB stdout logs |
 | `results/runs.csv` | Aggregated rows for plotting |
-| `cluster.conf` | Hostnames + per-cluster overrides (sourced by `run_matrix.sh`) |
-| `parse_ycsb_output.py` | YCSB stdout → one CSV row |
-| `run_matrix.sh` | 6×5 sweep wrapper |
-| `plot.py` | Renders the three charts from `runs.csv` (to be added) |
